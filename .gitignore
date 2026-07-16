@@ -1,0 +1,24 @@
+# macOS
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Temporary files
+*.tmp
+*.swp
+*~
+
+# Environment
+.env
+.env.*
+
+# Python
+__pycache__/
+
+# Node
+node_modules/
+
+# Windows
+Thumbs.db
