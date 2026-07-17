@@ -1,29 +1,49 @@
-#!/bin/zsh
+#!/bin/bash
+set -e
 
-set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
 
-cd "$(dirname "$0")/.."
+echo "=== World Brief ==="
 
-mkdir -p briefs logs
+# 仮想環境
+source .venv/bin/activate
 
-DATE="$(TZ=Asia/Tokyo date +%F)"
-OUTPUT="briefs/$DATE.md"
-TEMP_FILE="$(mktemp)"
-LOG_FILE="logs/$DATE.log"
+# 今日の日付
+TODAY=$(date +%F)
 
-echo "Generating World Brief for $DATE..."
+PROMPT="prompts/daily.md"
+OUTPUT="briefs/${TODAY}.md"
+TMP="${OUTPUT}.tmp"
 
-if codex exec - < prompts/daily.md > "$TEMP_FILE" 2>> "$LOG_FILE"; then
-  if [[ -s "$TEMP_FILE" ]]; then
-    mv "$TEMP_FILE" "$OUTPUT"
-    echo "Saved to $OUTPUT"
-  else
-    echo "Error: generated file is empty."
-    rm -f "$TEMP_FILE"
-    exit 1
-  fi
+echo "Generating brief..."
+
+# Codex実行
+codex exec - < "$PROMPT" > "$TMP"
+
+if [ -s "$TMP" ]; then
+    mv "$TMP" "$OUTPUT"
+    echo "Created $OUTPUT"
 else
-  echo "Error: Codex generation failed. Existing brief was not changed."
-  rm -f "$TEMP_FILE"
-  exit 1
+    echo "Codex returned no output."
+    rm -f "$TMP"
+    exit 1
 fi
+
+echo "Building HTML..."
+python scripts/build_html.py
+
+echo "Git commit..."
+
+git add .
+
+# 変更がない場合はコミットしない
+if git diff --cached --quiet; then
+    echo "No changes."
+else
+    git commit -m "World Brief ${TODAY}"
+    git push
+fi
+
+echo
+echo "Done!"
