@@ -19,7 +19,7 @@ TMP="${OUTPUT}.tmp"
 echo "Generating brief..."
 
 # Codex実行
-codex exec - < "$PROMPT" > "$TMP"
+/opt/homebrew/bin/codex exec - < "$PROMPT" > "$TMP"
 
 if [ -s "$TMP" ]; then
     mv "$TMP" "$OUTPUT"
