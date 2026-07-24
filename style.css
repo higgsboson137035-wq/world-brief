@@ -62,3 +62,27 @@ article a {
     word-break: break-word;
     white-space: normal;
 }
+
+article,
+article * {
+    min-width: 0;
+}
+
+article p,
+article li,
+article a {
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    white-space: normal;
+}
+
+@media (max-width: 600px) {
+    article {
+        padding: 20px;
+    }
+
+    ol {
+        padding-left: 1.4em;
+    }
+}
