@@ -13,6 +13,8 @@ article {
     padding: 40px;
     border-radius: 16px;
     box-shadow: 0 8px 30px rgba(0,0,0,.08);
+    overflow-wrap: anywhere;
+    word-break: break-word;
 }
 
 h1 {
@@ -40,8 +42,23 @@ code {
 a {
     color: #2563eb;
     text-decoration: none;
+    overflow-wrap: anywhere;
+    word-break: break-word;
 }
 
 a:hover {
     text-decoration: underline;
+}
+
+article,
+article * {
+    min-width: 0;
+}
+
+article p,
+article li,
+article a {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    white-space: normal;
 }
