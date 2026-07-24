@@ -12,7 +12,7 @@
 
 以下の見出しと順序を必ず使用してください。
 
-# World Brief | YYYY-MM-DD
+_Date: YYYY-MM-DD_
 
 ## Today's Top 3
 
