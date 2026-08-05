@@ -22,7 +22,21 @@
     "公式ソース未取得時の代替記事選定"
   ],
   "updated_at": "2026-08-04T20:42:04+09:00",
-  "data_note": "進捗率85%は既存ステータス値を維持しており、今回再算定していません。2026年8月4日版まで日次生成済みで、v2.3として出典リンクとレスポンシブ表示を改善済みです。generate.shによる一括生成・公開は実装済みですが、毎朝7時の完全自動実行設定はリポジトリ内で確認できません。必要セッション数は未評価です。"
+  "data_note": "進捗率85%は既存ステータス値を維持しており、今回再算定していません。2026年8月4日版まで日次生成済みで、v2.3として出典リンクとレスポンシブ表示を改善済みです。generate.shによる一括生成・公開は実装済みですが、毎朝7時の完全自動実行設定はリポジトリ内で確認できません。必要セッション数は未評価です。",
+  "repository": {
+    "git_enabled": true,
+    "github_enabled": true,
+    "github_visibility": "public",
+    "default_branch": "main"
+  },
+  "hosting": {
+    "enabled": true,
+    "provider": "GitHub Pages",
+    "type": "github_pages"
+  },
+  "deployment": {
+    "method": "git_push"
+  }
 }
 ```
 
