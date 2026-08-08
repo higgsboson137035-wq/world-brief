@@ -28,10 +28,21 @@ while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
 
     if [ ! -s "$TMP" ]; then
         echo "Codex returned no output."
+
     elif grep -Eq \
-        "Top 3は選定できません|掲載を見送ります|本日はニュース項目を掲載しません|該当する重要ニュースなし.*該当する重要ニュースなし.*該当する重要ニュースなし" \
+        "Top 3.*選定.*見送|Top 3.*選定できません|掲載を見送|ニュース項目を掲載しません" \
         "$TMP"; then
         echo "News retrieval appears incomplete."
+
+    elif ! grep -Eq '^1\.' "$TMP" \
+      || ! grep -Eq '^2\.' "$TMP" \
+      || ! grep -Eq '^3\.' "$TMP"; then
+        echo "Today's Top 3 is incomplete."
+
+    elif sed -n "/^## Today's Top 3$/,/^## Executive Summary$/p" "$TMP" \
+        | grep -q "該当する重要ニュースなし"; then
+        echo "Today's Top 3 contains no-news placeholders."
+
     else
         echo "Brief looks valid."
         break
@@ -60,7 +71,15 @@ if ! grep -Eq '^1\.' "$TMP" \
     exit 1
 fi
 
+if sed -n "/^## Today's Top 3$/,/^## Executive Summary$/p" "$TMP" \
+    | grep -q "該当する重要ニュースなし"; then
+    echo "News retrieval still contains no-news placeholders after ${MAX_ATTEMPTS} attempts."
+    rm -f "$TMP"
+    exit 1
+fi
+
 mv "$TMP" "$OUTPUT"
+
 echo "Created $OUTPUT"
 
 echo "Building HTML..."
