@@ -39,8 +39,11 @@ while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
       || ! grep -Eq '^3\.' "$TMP"; then
         echo "Today's Top 3 is incomplete."
 
-    elif sed -n "/^## Today's Top 3$/,/^## Executive Summary$/p" "$TMP" \
-        | grep -q "該当する重要ニュースなし"; then
+    elif awk '
+        /^## Today'\''s Top 3$/ { inside=1; next }
+        /^## / && inside { exit }
+        inside { print }
+    ' "$TMP" | grep -q "該当する重要ニュースなし"; then
         echo "Today's Top 3 contains no-news placeholders."
 
     else
@@ -49,14 +52,21 @@ while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
     fi
 
     if [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; then
-        echo "Retrying in 30 seconds..."
+        if [ "$ATTEMPT" -eq 1 ]; then
+            WAIT_SECONDS=30
+        else
+            WAIT_SECONDS=120
+        fi
+
+        echo "Retrying in ${WAIT_SECONDS} seconds..."
         rm -f "$TMP"
-        sleep 30
+        sleep "$WAIT_SECONDS"
     fi
 
     ATTEMPT=$((ATTEMPT + 1))
 done
 
+# 最終チェック
 if [ ! -s "$TMP" ]; then
     echo "Codex returned no usable output after ${MAX_ATTEMPTS} attempts."
     rm -f "$TMP"
@@ -71,15 +81,17 @@ if ! grep -Eq '^1\.' "$TMP" \
     exit 1
 fi
 
-if sed -n "/^## Today's Top 3$/,/^## Executive Summary$/p" "$TMP" \
-    | grep -q "該当する重要ニュースなし"; then
+if awk '
+    /^## Today'\''s Top 3$/ { inside=1; next }
+    /^## / && inside { exit }
+    inside { print }
+' "$TMP" | grep -q "該当する重要ニュースなし"; then
     echo "News retrieval still contains no-news placeholders after ${MAX_ATTEMPTS} attempts."
     rm -f "$TMP"
     exit 1
 fi
 
 mv "$TMP" "$OUTPUT"
-
 echo "Created $OUTPUT"
 
 echo "Building HTML..."
