@@ -46,7 +46,7 @@ while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
     ATTEMPT=$((ATTEMPT + 1))
 done
 
-if [ ! -s "$TMP" ]; thenif [ ! -s "$TMP" ]; then
+if [ ! -s "$TMP" ]; then
     echo "Codex returned no usable output after ${MAX_ATTEMPTS} attempts."
     rm -f "$TMP"
     exit 1
