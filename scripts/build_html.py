@@ -21,6 +21,7 @@ def render_page(title: str, body: str) -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{html.escape(title)}</title>
 <link rel="stylesheet" href="style.css">
+<link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
 </head>
 <body>
 <article>
