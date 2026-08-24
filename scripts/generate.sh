@@ -42,17 +42,39 @@ TMP="${OUTPUT}.tmp"
 echo "Generating brief..."
 
 MAX_ATTEMPTS=3
+FINAL_ATTEMPT=$((MAX_ATTEMPTS + 1))
 ATTEMPT=1
+BRIEF_VALID=0
 
-while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
-    echo "Attempt ${ATTEMPT}/${MAX_ATTEMPTS}..."
+while [ "$ATTEMPT" -le "$FINAL_ATTEMPT" ]; do
+    if [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; then
+        echo "Attempt ${ATTEMPT}/${MAX_ATTEMPTS}..."
+    else
+        echo "Final recovery attempt ${ATTEMPT}/${FINAL_ATTEMPT}..."
+    fi
 
     # 前回の一時ファイルを削除
     rm -f "$TMP"
 
-    /opt/homebrew/bin/codex --search exec - < "$PROMPT" > "$TMP"
+    if /opt/homebrew/bin/codex --search exec - < "$PROMPT" > "$TMP"; then
+        CODEX_EXIT=0
+    else
+        CODEX_EXIT=$?
+    fi
 
-    if [ ! -s "$TMP" ]; then
+    if [ -f "$TMP" ]; then
+        TMP_BYTES=$(wc -c < "$TMP" | tr -d '[:space:]')
+    else
+        TMP_BYTES=0
+    fi
+
+    echo "Codex exit code: ${CODEX_EXIT}"
+    echo "TMP file size: ${TMP_BYTES} bytes"
+
+    if [ "$CODEX_EXIT" -ne 0 ]; then
+        echo "Codex command failed."
+
+    elif [ ! -s "$TMP" ]; then
         echo "Codex returned no output."
 
     elif grep -Eq \
@@ -73,6 +95,7 @@ while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
         echo "Today's Top 3 contains no-news placeholders."
 
     else
+        BRIEF_VALID=1
         echo "Brief looks valid."
         break
     fi
@@ -87,14 +110,25 @@ while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
         echo "Retrying in ${WAIT_SECONDS} seconds..."
         rm -f "$TMP"
         sleep "$WAIT_SECONDS"
+
+    elif [ "$ATTEMPT" -eq "$MAX_ATTEMPTS" ]; then
+        echo "All ${MAX_ATTEMPTS} normal attempts failed."
+        echo "Starting final recovery attempt..."
+        rm -f "$TMP"
     fi
 
     ATTEMPT=$((ATTEMPT + 1))
 done
 
+if [ "$BRIEF_VALID" -ne 1 ]; then
+    echo "Codex returned no valid brief after ${FINAL_ATTEMPT} attempts."
+    rm -f "$TMP"
+    exit 1
+fi
+
 # 最終チェック
 if [ ! -s "$TMP" ]; then
-    echo "Codex returned no usable output after ${MAX_ATTEMPTS} attempts."
+    echo "Codex returned no usable output after ${FINAL_ATTEMPT} attempts."
     rm -f "$TMP"
     exit 1
 fi
@@ -102,7 +136,7 @@ fi
 if ! grep -Eq '^1\.' "$TMP" \
   || ! grep -Eq '^2\.' "$TMP" \
   || ! grep -Eq '^3\.' "$TMP"; then
-    echo "News retrieval still failed after ${MAX_ATTEMPTS} attempts."
+    echo "News retrieval still failed after ${FINAL_ATTEMPT} attempts."
     rm -f "$TMP"
     exit 1
 fi
@@ -110,7 +144,7 @@ fi
 if grep -Eq \
     "Top 3.*選定.*見送|Top 3.*選定できません|掲載を見送|ニュース項目を掲載しません" \
     "$TMP"; then
-    echo "News retrieval still appears incomplete after ${MAX_ATTEMPTS} attempts."
+    echo "News retrieval still appears incomplete after ${FINAL_ATTEMPT} attempts."
     rm -f "$TMP"
     exit 1
 fi
@@ -120,7 +154,7 @@ if awk '
     /^## / && inside { exit }
     inside { print }
 ' "$TMP" | grep -q "該当する重要ニュースなし"; then
-    echo "News retrieval still contains no-news placeholders after ${MAX_ATTEMPTS} attempts."
+    echo "News retrieval still contains no-news placeholders after ${FINAL_ATTEMPT} attempts."
     rm -f "$TMP"
     exit 1
 fi
