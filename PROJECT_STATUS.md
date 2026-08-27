@@ -5,14 +5,14 @@
   "schema_version": 1,
   "project_id": "world-brief",
   "name": "World Brief",
-  "status": "運用評価中",
+  "status": "日次運用中",
   "progress_percent": 92,
   "priority": "高",
-  "current_work": "ライブWeb検索導入後の生成品質と安定性の確認",
+  "current_work": "日次自動生成の継続運用とv2.4確定判断",
   "remaining_tasks": [
-    "数日間の自動生成結果を確認",
-    "空記事が再発しないことを確認",
     "Today's Top 3とBig Pictureの品質を評価",
+    "同日再生成時の品質比較方法を整備",
+    "生成失敗や空記事を検知する品質チェックを検討",
     "v2.4タグ付けの可否を判断"
   ],
   "estimated_sessions": 1,
@@ -23,13 +23,19 @@
     "同日の再生成で記事選定や表現が変動する",
     "ライブ検索により生成時間とトークン使用量が増える"
   ],
-  "updated_at": "2026-08-07T18:23:00+09:00",
-  "data_note": "v2.3でモバイル表示と出典リンクを改善し、v2.3.2でカテゴリ独立性と編集方針を強化した。2026-08-06にCodex CLIのライブWeb検索を有効化し、空記事問題を解消。現在はv2.4候補として運用品質を確認中。",
+  "updated_at": "2026-08-27T23:37:22+09:00",
+  "data_note": "v2.3でモバイル表示と出典リンクを改善し、v2.3.2でカテゴリ独立性と編集方針を強化しました。2026-08-06にCodex CLIのライブWeb検索を有効化して空記事問題を解消し、2026-08-27まで日次成果物の生成とコミットが継続しています。進捗92%と必要セッション数1は既存の暫定値を維持し、v2.4確定はHuman Review待ちです。",
   "planning": {
     "target_date": null,
     "planned_duration_months": null,
     "work_mode": "maintenance",
     "minimum_sessions_per_week": 0
+  },
+  "repository": {
+    "git_enabled": true,
+    "github_enabled": true,
+    "github_visibility": null,
+    "default_branch": "main"
   }
 }
 ```
@@ -38,7 +44,7 @@
 
 英語の主要報道機関と政府・国際機関の一次情報をもとに、日本語で簡潔かつ分析的な世界情勢ブリーフを毎朝自動生成し、GitHub Pagesで公開するプロジェクトです。
 
-現在は、日次生成・HTML変換・Gitコミット・GitHubへの公開まで自動化されており、ライブWeb検索導入後の品質と安定性を確認しています。
+現在は、日次生成・HTML変換・Gitコミット・GitHubへの公開まで自動化されており、2026年8月27日分まで日次成果物の生成が継続しています。
 
 ---
 
@@ -74,9 +80,9 @@
 
 ## 現在のフェーズ
 
-ライブWeb検索導入後の運用評価期間です。
+ライブWeb検索導入後の日次運用を継続しながら、v2.4として確定するためのHuman Reviewを待っています。
 
-数日間の日次生成を確認し、次の条件を満たした場合にv2.4として確定します。
+次の品質条件をHuman Reviewで満たした場合にv2.4として確定します。
 
 - 空記事が再発しない
 - 個別記事の公式URLが安定して取得される
