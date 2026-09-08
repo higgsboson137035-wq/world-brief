@@ -18,6 +18,8 @@ _Date: YYYY-MM-DD_
 
 ## Today's Top 3
 
+Today's Top 3は必ず3項目記載し、各項目を行頭から半角数字＋半角ピリオド＋半角スペースの `1. `、`2. `、`3. ` 形式で記載する。番号を省略せず、全角数字、全角ピリオド、`1)`など別形式は使用しない。
+
 ## Executive Summary
 
 ## Why It Matters
