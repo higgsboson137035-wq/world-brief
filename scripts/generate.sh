@@ -54,6 +54,14 @@ source_article_urls() {
     sed -nE 's#^🔗 \[原文を読む\]\((https?://[^)]*)\)[[:space:]]*$#\1#p' "$1"
 }
 
+has_minimum_source_article_urls() {
+    source_article_urls "$1" | sort -u | awk 'END { exit !(NR >= 3) }'
+}
+
+has_invalid_source_article_link() {
+    grep -F '🔗 [原文を読む]' "$1" | grep -Ev '^🔗 \[原文を読む\]\(https://[^[:space:]]+\)[[:space:]]*$' | grep -q .
+}
+
 has_duplicate_source_article_link() {
     source_article_urls "$1" | sort | uniq -d | grep -q .
 }
@@ -112,6 +120,12 @@ while [ "$ATTEMPT" -le "$FINAL_ATTEMPT" ]; do
 
     elif ! has_source_article_link "$TMP"; then
         echo "Brief contains no source article links."
+
+    elif has_invalid_source_article_link "$TMP"; then
+        echo "Brief contains invalid source article links."
+
+    elif ! has_minimum_source_article_urls "$TMP"; then
+        echo "Brief contains fewer than three distinct source article links."
 
     elif has_duplicate_source_article_link "$TMP"; then
         echo "Brief contains duplicate source article links."
@@ -186,6 +200,18 @@ fi
 
 if ! has_source_article_link "$TMP"; then
     echo "Brief contains no source article links after ${FINAL_ATTEMPT} attempts."
+    rm -f "$TMP"
+    exit 1
+fi
+
+if has_invalid_source_article_link "$TMP"; then
+    echo "Brief contains invalid source article links after ${FINAL_ATTEMPT} attempts."
+    rm -f "$TMP"
+    exit 1
+fi
+
+if ! has_minimum_source_article_urls "$TMP"; then
+    echo "Brief contains fewer than three distinct source article links after ${FINAL_ATTEMPT} attempts."
     rm -f "$TMP"
     exit 1
 fi
