@@ -50,6 +50,18 @@ has_source_article_link() {
     grep -Eq '^🔗 \[原文を読む\]\(https?://[^[:space:]]+\)[[:space:]]*$' "$1"
 }
 
+source_article_urls() {
+    sed -nE 's#^🔗 \[原文を読む\]\((https?://[^)]*)\)[[:space:]]*$#\1#p' "$1"
+}
+
+has_duplicate_source_article_link() {
+    source_article_urls "$1" | sort | uniq -d | grep -q .
+}
+
+has_reuters_world_category_link() {
+    source_article_urls "$1" | grep -Eq '^https://www\.reuters\.com/world/?$'
+}
+
 while [ "$ATTEMPT" -le "$FINAL_ATTEMPT" ]; do
     if [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; then
         echo "Attempt ${ATTEMPT}/${MAX_ATTEMPTS}..."
@@ -100,6 +112,12 @@ while [ "$ATTEMPT" -le "$FINAL_ATTEMPT" ]; do
 
     elif ! has_source_article_link "$TMP"; then
         echo "Brief contains no source article links."
+
+    elif has_duplicate_source_article_link "$TMP"; then
+        echo "Brief contains duplicate source article links."
+
+    elif has_reuters_world_category_link "$TMP"; then
+        echo "Brief contains a Reuters world category link."
 
     else
         BRIEF_VALID=1
@@ -168,6 +186,18 @@ fi
 
 if ! has_source_article_link "$TMP"; then
     echo "Brief contains no source article links after ${FINAL_ATTEMPT} attempts."
+    rm -f "$TMP"
+    exit 1
+fi
+
+if has_duplicate_source_article_link "$TMP"; then
+    echo "Brief contains duplicate source article links after ${FINAL_ATTEMPT} attempts."
+    rm -f "$TMP"
+    exit 1
+fi
+
+if has_reuters_world_category_link "$TMP"; then
+    echo "Brief contains a Reuters world category link after ${FINAL_ATTEMPT} attempts."
     rm -f "$TMP"
     exit 1
 fi
