@@ -46,6 +46,10 @@ FINAL_ATTEMPT=$((MAX_ATTEMPTS + 1))
 ATTEMPT=1
 BRIEF_VALID=0
 
+has_source_article_link() {
+    grep -Eq '^🔗 \[原文を読む\]\(https?://[^[:space:]]+\)[[:space:]]*$' "$1"
+}
+
 while [ "$ATTEMPT" -le "$FINAL_ATTEMPT" ]; do
     if [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; then
         echo "Attempt ${ATTEMPT}/${MAX_ATTEMPTS}..."
@@ -93,6 +97,9 @@ while [ "$ATTEMPT" -le "$FINAL_ATTEMPT" ]; do
         inside { print }
     ' "$TMP" | grep -q "該当する重要ニュースなし"; then
         echo "Today's Top 3 contains no-news placeholders."
+
+    elif ! has_source_article_link "$TMP"; then
+        echo "Brief contains no source article links."
 
     else
         BRIEF_VALID=1
@@ -155,6 +162,12 @@ if awk '
     inside { print }
 ' "$TMP" | grep -q "該当する重要ニュースなし"; then
     echo "News retrieval still contains no-news placeholders after ${FINAL_ATTEMPT} attempts."
+    rm -f "$TMP"
+    exit 1
+fi
+
+if ! has_source_article_link "$TMP"; then
+    echo "Brief contains no source article links after ${FINAL_ATTEMPT} attempts."
     rm -f "$TMP"
     exit 1
 fi
