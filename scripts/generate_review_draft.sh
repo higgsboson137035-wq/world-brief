@@ -1,0 +1,235 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+fail() {
+    printf 'SAFE_DRAFT_FAILED: %s\n' "$1" >&2
+    exit 1
+}
+
+TODAY="$(date +%F)"
+DRAFT_DIR_OVERRIDE="${WORLD_BRIEF_DRAFT_DIR:-}"
+if [[ -z "$DRAFT_DIR_OVERRIDE" ]]; then
+    DRAFT_DIR="$ROOT/drafts"
+else
+    case "$DRAFT_DIR_OVERRIDE" in
+        drafts/*) ;;
+        *) fail "draft_directory_must_be_under_drafts" ;;
+    esac
+    if [[ -L "$ROOT/drafts" ]]; then fail "draft_directory_symlink_rejected"; fi
+    DRAFT_DIR="$ROOT/drafts"
+    relative_dir="${DRAFT_DIR_OVERRIDE#drafts/}"
+    IFS='/' read -r -a draft_parts <<< "$relative_dir"
+    for part in "${draft_parts[@]}"; do
+        if [[ -z "$part" || "$part" == "." || "$part" == ".." ]]; then
+            fail "draft_directory_path_invalid"
+        fi
+        DRAFT_DIR="$DRAFT_DIR/$part"
+        if [[ -L "$DRAFT_DIR" ]]; then fail "draft_directory_symlink_rejected"; fi
+        if [[ -e "$DRAFT_DIR" && ! -d "$DRAFT_DIR" ]]; then fail "draft_directory_not_a_directory"; fi
+        if [[ ! -d "$DRAFT_DIR" ]]; then mkdir "$DRAFT_DIR" || fail "draft_directory_create_failed"; fi
+    done
+fi
+DRAFT_MD="$DRAFT_DIR/${TODAY}-human-review.md"
+DRAFT_HTML="$DRAFT_DIR/${TODAY}-human-review.html"
+PROMPT="$ROOT/prompts/daily_review_draft.md"
+CODEX_BIN="${WORLD_BRIEF_CODEX_BIN:-/opt/homebrew/bin/codex}"
+PYTHON_BIN="${WORLD_BRIEF_PYTHON_BIN:-$ROOT/.venv/bin/python}"
+MAX_ATTEMPTS="${WORLD_BRIEF_MAX_ATTEMPTS:-4}"
+MAX_OUTPUT_BYTES=1048576
+CODEX_TIMEOUT_SECONDS=1200
+
+if [[ ! -d "$DRAFT_DIR" ]]; then fail "draft_directory_missing"; fi
+if [[ ! -f "$PROMPT" ]]; then fail "prompt_missing"; fi
+if [[ ! -x "$CODEX_BIN" ]]; then fail "codex_cli_unavailable"; fi
+if [[ ! -x "$PYTHON_BIN" ]]; then fail "project_python_unavailable"; fi
+case "$MAX_ATTEMPTS" in
+    1|2|3|4) ;;
+    *) fail "invalid_attempt_limit" ;;
+esac
+if [[ -e "$DRAFT_MD" || -L "$DRAFT_MD" || -e "$DRAFT_HTML" || -L "$DRAFT_HTML" ]]; then
+    fail "draft_already_exists"
+fi
+
+WORK_DIR="$(mktemp -d "$DRAFT_DIR/.${TODAY}-review.XXXXXX")" || fail "temporary_directory_unavailable"
+trap 'rm -rf "$WORK_DIR"' EXIT
+RAW_OUTPUT="$WORK_DIR/codex-output.md"
+STAGED_MD="$WORK_DIR/review-draft.md"
+STAGED_HTML="$WORK_DIR/review-draft.html"
+
+printf 'Checking network availability...\n'
+NETWORK_READY=0
+for attempt in {1..12}; do
+    if curl -fsS --max-time 5 https://www.apple.com/ >/dev/null 2>&1; then
+        NETWORK_READY=1
+        break
+    fi
+    if [[ "$attempt" -lt 12 ]]; then sleep 10; fi
+done
+if [[ "$NETWORK_READY" -ne 1 ]]; then fail "network_unavailable"; fi
+
+validate_brief() {
+    local candidate="$1"
+    local reason
+    if reason="$("$PYTHON_BIN" -B "$ROOT/scripts/review_draft_gate.py" "$candidate" "$TODAY")"; then
+        printf '%s' "$reason"
+    elif [[ -n "$reason" ]]; then
+        printf '%s' "$reason"
+    else
+        printf 'quality_gate_failed'
+    fi
+}
+
+run_codex() {
+    "$PYTHON_BIN" -B - "$CODEX_BIN" "$PROMPT" "$RAW_OUTPUT" "$CODEX_TIMEOUT_SECONDS" <<'PY'
+import subprocess
+import sys
+
+binary, prompt_path, output_path, timeout = sys.argv[1:]
+try:
+    with open(prompt_path, "rb") as prompt, open(output_path, "wb") as output:
+        result = subprocess.run(
+            [binary, "--search", "exec", "-"],
+            stdin=prompt,
+            stdout=output,
+            check=False,
+            timeout=int(timeout),
+        )
+except subprocess.TimeoutExpired:
+    raise SystemExit(124)
+except OSError:
+    raise SystemExit(125)
+raise SystemExit(result.returncode)
+PY
+}
+
+echo "Generating Human Review draft..."
+ATTEMPT=1
+BRIEF_VALID=0
+while [[ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]]; do
+    : > "$RAW_OUTPUT"
+    if run_codex; then
+        CODEX_EXIT=0
+    else
+        CODEX_EXIT=$?
+    fi
+
+    if [[ "$CODEX_EXIT" -ne 0 ]]; then
+        FAILURE_REASON="codex_exit_nonzero"
+    else
+        FAILURE_REASON="$(validate_brief "$RAW_OUTPUT")"
+    fi
+
+    if [[ "$FAILURE_REASON" == "pass" ]]; then
+        BRIEF_VALID=1
+        break
+    fi
+    if [[ "$FAILURE_REASON" == "no_publish_insufficient_verified_articles" ]]; then
+        printf 'NO_PUBLISH reason=insufficient_verified_articles\n'
+        # Exit 10 is the wrapper's explicit expected-no-publish signal.
+        exit 10
+    fi
+    printf 'Attempt %s/%s failed: %s\n' "$ATTEMPT" "$MAX_ATTEMPTS" "$FAILURE_REASON" >&2
+    if [[ "$ATTEMPT" -lt "$MAX_ATTEMPTS" && "$ATTEMPT" -lt 3 ]]; then
+        if [[ "$ATTEMPT" -eq 1 ]]; then sleep 30; else sleep 120; fi
+    fi
+    ATTEMPT=$((ATTEMPT + 1))
+done
+
+if [[ "$BRIEF_VALID" -ne 1 ]]; then fail "generation_or_quality_gate_failed"; fi
+
+if ! "$PYTHON_BIN" -B - "$RAW_OUTPUT" "$TODAY" "$STAGED_MD" "$STAGED_HTML" "$ROOT/style.css" <<'PY'
+from html.parser import HTMLParser
+from pathlib import Path
+import html
+import re
+import sys
+import markdown
+
+raw_path, today, md_path, html_path, _style_path = sys.argv[1:]
+source = Path(raw_path).read_text(encoding="utf-8")
+urls = set(re.findall(r"^🔗 \[原文を読む\]\((https://[^)]+)\)[ \t]*$", source, re.MULTILINE))
+if re.search(r"<\s*/?\s*[A-Za-z!][^>]*>", source):
+    print("render_rejected_raw_html")
+    raise SystemExit(1)
+
+allowed_tags = {"h1", "h2", "h3", "h4", "h5", "h6", "p", "ol", "ul", "li", "strong", "em", "a", "hr", "br", "blockquote", "code", "pre"}
+void_tags = {"hr", "br"}
+
+class Sanitizer(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.output = []
+        self.stack = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag not in allowed_tags:
+            raise ValueError("tag")
+        if tag == "a":
+            values = dict(attrs)
+            href = values.get("href", "")
+            if set(values) != {"href"} or href not in urls or not href.startswith("https://"):
+                raise ValueError("link")
+            self.output.append('<a href="' + html.escape(href, quote=True) + '" rel="noopener noreferrer">')
+        else:
+            if attrs:
+                raise ValueError("attribute")
+            self.output.append("<" + tag + ">")
+        if tag not in void_tags:
+            self.stack.append(tag)
+
+    def handle_endtag(self, tag):
+        if tag in void_tags:
+            return
+        if not self.stack or self.stack[-1] != tag:
+            raise ValueError("nesting")
+        self.stack.pop()
+        self.output.append("</" + tag + ">")
+
+    def handle_data(self, data):
+        self.output.append(html.escape(data))
+
+try:
+    body = markdown.markdown(source)
+    cleaner = Sanitizer()
+    cleaner.feed(body)
+    cleaner.close()
+    if cleaner.stack:
+        raise ValueError("unclosed")
+    if not urls or any(not url.startswith("https://") for url in urls):
+        raise ValueError("source")
+    final_md = (
+        "# World Brief — Human確認前・未公開\n\n"
+        "> 記事の事実・出典・日時・リンクはHuman未確認です。\n\n"
+        + source
+    )
+    page = (
+        "<!doctype html>\n<html lang=\"ja\">\n<head>\n"
+        "<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+        f"<title>World Brief — {today} — Human Review</title>\n"
+        "<link rel=\"stylesheet\" href=\"../style.css\">\n</head>\n<body>\n<article>\n"
+        "<aside style=\"border:2px solid #9a3412;background:#fff7ed;padding:1rem;margin-bottom:1rem\">"
+        "<strong>Human確認前・未公開</strong><p>記事の事実・出典・日時・リンクはHuman未確認です。</p></aside>\n"
+        + "".join(cleaner.output)
+        + "\n</article>\n</body>\n</html>\n"
+    )
+    Path(md_path).write_text(final_md, encoding="utf-8")
+    Path(html_path).write_text(page, encoding="utf-8")
+except Exception:
+    print("html_render_failed")
+    raise SystemExit(1)
+PY
+then
+    fail "html_render_failed"
+fi
+
+if [[ ! -s "$STAGED_MD" || ! -s "$STAGED_HTML" ]]; then fail "draft_render_output_missing"; fi
+if [[ -e "$DRAFT_MD" || -L "$DRAFT_MD" || -e "$DRAFT_HTML" || -L "$DRAFT_HTML" ]]; then
+    fail "draft_already_exists"
+fi
+if ! mv "$STAGED_MD" "$DRAFT_MD"; then fail "draft_markdown_save_failed"; fi
+if ! mv "$STAGED_HTML" "$DRAFT_HTML"; then fail "draft_html_save_failed"; fi
+
+printf 'SAFE-AUTO-DRAFT=READY\nMarkdown: %s\nHTML: %s\n' "$DRAFT_MD" "$DRAFT_HTML"
