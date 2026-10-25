@@ -23,7 +23,10 @@ class RecordNoPublishTests(unittest.TestCase):
         (self.root / "briefs/2026-10-24.md").write_text(
             "_Date: 2026-10-24_\nPrevious published brief.\n", encoding="utf-8"
         )
-        self.previous_html = "<!doctype html><html><body>Previous public article content</body></html>\n"
+        self.previous_html = (
+            "<!doctype html><html><body><p><em>Date: 2026-10-24</em></p>"
+            "Previous public article content</body></html>\n"
+        )
         (self.root / "2026-10-24.html").write_text(self.previous_html, encoding="utf-8")
         (self.root / "latest.html").write_text(self.previous_html, encoding="utf-8")
         (self.root / "archive.html").write_text(
@@ -37,6 +40,7 @@ class RecordNoPublishTests(unittest.TestCase):
             "<p><small>最終更新: 2026-10-24 07:00</small></p>\n"
             "</header>\n\n<hr>\n"
             "<p><em>Date: 2026-10-24</em></p>\n"
+            "<h2>Today's Top 3</h2>\n"
             "<main>Previous published article remains here.</main>\n"
             "</article></body></html>\n",
             encoding="utf-8",
@@ -93,9 +97,10 @@ class RecordNoPublishTests(unittest.TestCase):
         self.assertIn("所定の確認基準を満たす記事を十分に確保できなかったため", index)
         self.assertIn('<a href="2026-10-24.html">2026年10月24日版 World Brief</a>', index)
         self.assertIn("<h2>最新の公開記事 — 2026年10月24日</h2>", index)
-        self.assertLess(index.index("最新の公開記事 — 2026年10月24日"), index.index("Date: 2026-10-24"))
+        self.assertNotIn("Date: 2026-10-24", index)
+        self.assertLess(index.index("最新の公開記事 — 2026年10月24日"), index.index("Today's Top 3"))
         self.assertNotIn("最終更新: 2026-10-24", index)
-        self.assertIn("Date: 2026-10-24", index)
+        self.assertIn("Date: 2026-10-24", (self.root / "2026-10-24.html").read_text(encoding="utf-8"))
         self.assertIn("Previous published article remains here.", index)
         self.assertNotIn("INSUFFICIENT_VERIFIED_ARTICLES", index)
         self.assertNotIn("2026-10-25.html", index)

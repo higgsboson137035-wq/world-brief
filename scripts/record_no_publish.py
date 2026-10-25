@@ -185,6 +185,18 @@ def apply_no_publish_display(
         "no_publish_article_heading_markers_invalid",
     )
     changed |= did_change
+
+    article_date = re.compile(
+        rf"<p><em>Date: {re.escape(latest_date)}</em></p>\n?"
+    )
+    date_matches = article_date.findall(updated)
+    if len(date_matches) == 1:
+        updated, removed = article_date.subn("", updated, count=1)
+        changed |= removed == 1
+    elif len(date_matches) == 0 and article_heading in updated:
+        pass
+    else:
+        raise NoPublishFailure("latest_article_date_anchor_invalid")
     return updated, changed
 
 
