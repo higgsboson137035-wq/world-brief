@@ -6,10 +6,10 @@ cd "$ROOT"
 
 fail() {
     printf 'SAFE_DRAFT_FAILED: %s\n' "$1" >&2
-    exit 1
+    exit "${2:-1}"
 }
 
-TODAY="$(date +%F)"
+TODAY="${WORLD_BRIEF_RUN_DATE:-$(date +%F)}"
 DRAFT_DIR_OVERRIDE="${WORLD_BRIEF_DRAFT_DIR:-}"
 if [[ -z "$DRAFT_DIR_OVERRIDE" ]]; then
     DRAFT_DIR="$ROOT/drafts"
@@ -37,7 +37,6 @@ DRAFT_HTML="$DRAFT_DIR/${TODAY}-human-review.html"
 PROMPT="$ROOT/prompts/daily_review_draft.md"
 CODEX_BIN="${WORLD_BRIEF_CODEX_BIN:-/opt/homebrew/bin/codex}"
 PYTHON_BIN="${WORLD_BRIEF_PYTHON_BIN:-$ROOT/.venv/bin/python}"
-MAX_ATTEMPTS="${WORLD_BRIEF_MAX_ATTEMPTS:-4}"
 MAX_OUTPUT_BYTES=1048576
 CODEX_TIMEOUT_SECONDS=1200
 
@@ -45,10 +44,6 @@ if [[ ! -d "$DRAFT_DIR" ]]; then fail "draft_directory_missing"; fi
 if [[ ! -f "$PROMPT" ]]; then fail "prompt_missing"; fi
 if [[ ! -x "$CODEX_BIN" ]]; then fail "codex_cli_unavailable"; fi
 if [[ ! -x "$PYTHON_BIN" ]]; then fail "project_python_unavailable"; fi
-case "$MAX_ATTEMPTS" in
-    1|2|3|4) ;;
-    *) fail "invalid_attempt_limit" ;;
-esac
 if [[ -e "$DRAFT_MD" || -L "$DRAFT_MD" || -e "$DRAFT_HTML" || -L "$DRAFT_HTML" ]]; then
     fail "draft_already_exists"
 fi
@@ -56,8 +51,15 @@ fi
 WORK_DIR="$(mktemp -d "$DRAFT_DIR/.${TODAY}-review.XXXXXX")" || fail "temporary_directory_unavailable"
 trap 'rm -rf "$WORK_DIR"' EXIT
 RAW_OUTPUT="$WORK_DIR/codex-output.md"
+GATE_OUTPUT="$WORK_DIR/brief-output.md"
+CANDIDATE_OUTPUT="$WORK_DIR/candidates.json"
 STAGED_MD="$WORK_DIR/review-draft.md"
 STAGED_HTML="$WORK_DIR/review-draft.html"
+DIAGNOSTICS="$ROOT/scripts/run_diagnostics.py"
+
+if [[ ! -f "$ROOT/logs/runs/$TODAY/diagnostic.json" ]]; then
+    "$PYTHON_BIN" -B "$DIAGNOSTICS" start "$TODAY" || fail "diagnostic_run_start_failed"
+fi
 
 printf 'Checking network availability...\n'
 NETWORK_READY=0
@@ -68,7 +70,7 @@ for attempt in {1..12}; do
     fi
     if [[ "$attempt" -lt 12 ]]; then sleep 10; fi
 done
-if [[ "$NETWORK_READY" -ne 1 ]]; then fail "network_unavailable"; fi
+if [[ "$NETWORK_READY" -ne 1 ]]; then fail "network_unavailable" 12; fi
 
 validate_brief() {
     local candidate="$1"
@@ -83,7 +85,8 @@ validate_brief() {
 }
 
 run_codex() {
-    "$PYTHON_BIN" -B - "$CODEX_BIN" "$PROMPT" "$RAW_OUTPUT" "$CODEX_TIMEOUT_SECONDS" <<'PY'
+    local rendered_prompt="$1"
+    "$PYTHON_BIN" -B - "$CODEX_BIN" "$rendered_prompt" "$RAW_OUTPUT" "$CODEX_TIMEOUT_SECONDS" <<'PY'
 import subprocess
 import sys
 
@@ -106,11 +109,22 @@ PY
 }
 
 echo "Generating Human Review draft..."
-ATTEMPT=1
 BRIEF_VALID=0
-while [[ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]]; do
+ATTEMPT=0
+for STAGE in GENERAL TRUSTED_SOURCES CATEGORY_EXPANSION; do
+    ATTEMPT=$((ATTEMPT + 1))
+    RENDERED_PROMPT="$WORK_DIR/prompt-${STAGE}.md"
+    "$PYTHON_BIN" -B "$DIAGNOSTICS" render-prompt "$PROMPT" "$RENDERED_PROMPT" "$STAGE" || fail "prompt_stage_render_failed"
+    case "$STAGE" in
+        GENERAL) STRATEGY=GENERAL; QUERY_FAMILY=general_world_news ;;
+        TRUSTED_SOURCES) STRATEGY=TRUSTED_SOURCES; QUERY_FAMILY=source_targeted_AP_REUTERS_BBC ;;
+        CATEGORY_EXPANSION) STRATEGY=CATEGORY_EXPANSION; QUERY_FAMILY='geopolitics_conflict|world_politics_diplomacy|economy_energy|disasters|security|science_technology' ;;
+    esac
     : > "$RAW_OUTPUT"
-    if run_codex; then
+    RESPONSE_STATUS="UNKNOWN"
+    CANDIDATE_STATUS="UNKNOWN"
+    SENTINEL_SEEN="false"
+    if run_codex "$RENDERED_PROMPT"; then
         CODEX_EXIT=0
     else
         CODEX_EXIT=$?
@@ -118,29 +132,56 @@ while [[ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]]; do
 
     if [[ "$CODEX_EXIT" -ne 0 ]]; then
         FAILURE_REASON="codex_exit_nonzero"
+        : > "$GATE_OUTPUT"
+        printf '{"status":"UNKNOWN","coverage":"UNKNOWN","candidates":[]}\n' > "$CANDIDATE_OUTPUT"
+        GATE_RESULT="FAIL"
     else
-        FAILURE_REASON="$(validate_brief "$RAW_OUTPUT")"
+        if EXTRACT_INFO="$("$PYTHON_BIN" -B "$DIAGNOSTICS" extract "$RAW_OUTPUT" "$GATE_OUTPUT" "$CANDIDATE_OUTPUT" 2>&1)"; then
+            read -r RESPONSE_STATUS CANDIDATE_STATUS <<< "$EXTRACT_INFO"
+            FAILURE_REASON="$(validate_brief "$GATE_OUTPUT")"
+        else
+            FAILURE_REASON="diagnostic_output_invalid"
+            : > "$GATE_OUTPUT"
+            printf '{"status":"UNKNOWN","coverage":"UNKNOWN","candidates":[]}\n' > "$CANDIDATE_OUTPUT"
+        fi
+        if [[ "$FAILURE_REASON" == "pass" ]]; then
+            GATE_RESULT="PASS"
+        elif [[ "$FAILURE_REASON" == "no_publish_insufficient_verified_articles" ]]; then
+            GATE_RESULT="RETRY"
+        else
+            GATE_RESULT="FAIL"
+        fi
     fi
+
+    if [[ "$RESPONSE_STATUS" == "NO_PUBLISH" || "$FAILURE_REASON" == "no_publish_insufficient_verified_articles" ]]; then
+        SENTINEL_SEEN="true"
+    fi
+    "$PYTHON_BIN" -B "$DIAGNOSTICS" attempt "$TODAY" "$ATTEMPT" "$CODEX_EXIT" \
+        "$GATE_RESULT" "$FAILURE_REASON" "$SENTINEL_SEEN" "$CANDIDATE_STATUS" \
+        "$RAW_OUTPUT" "$CANDIDATE_OUTPUT" "$GATE_OUTPUT" "$STAGE" "$STRATEGY" "$QUERY_FAMILY" || fail "diagnostic_attempt_save_failed"
 
     if [[ "$FAILURE_REASON" == "pass" ]]; then
         BRIEF_VALID=1
         break
     fi
     if [[ "$FAILURE_REASON" == "no_publish_insufficient_verified_articles" ]]; then
-        printf 'NO_PUBLISH reason=insufficient_verified_articles\n'
-        # Exit 10 is the wrapper's explicit expected-no-publish signal.
-        exit 10
+        if [[ "$STAGE" == "CATEGORY_EXPANSION" ]]; then
+            printf 'RETRIEVAL_EXHAUSTED reason=search_strategies_exhausted\n'
+            exit 11
+        fi
+        continue
     fi
-    printf 'Attempt %s/%s failed: %s\n' "$ATTEMPT" "$MAX_ATTEMPTS" "$FAILURE_REASON" >&2
-    if [[ "$ATTEMPT" -lt "$MAX_ATTEMPTS" && "$ATTEMPT" -lt 3 ]]; then
-        if [[ "$ATTEMPT" -eq 1 ]]; then sleep 30; else sleep 120; fi
+    if [[ "$CODEX_EXIT" -ne 0 ]]; then
+        printf 'Generation stopped at %s: %s (exit=%s)\n' "$STAGE" "$FAILURE_REASON" "$CODEX_EXIT" >&2
+        fail "$FAILURE_REASON" 13
     fi
-    ATTEMPT=$((ATTEMPT + 1))
+    printf 'Generation stopped at %s: %s\n' "$STAGE" "$FAILURE_REASON" >&2
+    fail "$FAILURE_REASON" 13
 done
 
 if [[ "$BRIEF_VALID" -ne 1 ]]; then fail "generation_or_quality_gate_failed"; fi
 
-if ! "$PYTHON_BIN" -B - "$RAW_OUTPUT" "$TODAY" "$STAGED_MD" "$STAGED_HTML" "$ROOT/style.css" <<'PY'
+if ! "$PYTHON_BIN" -B - "$GATE_OUTPUT" "$TODAY" "$STAGED_MD" "$STAGED_HTML" "$ROOT/style.css" <<'PY'
 from html.parser import HTMLParser
 from pathlib import Path
 import html

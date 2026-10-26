@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 import re
@@ -11,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "generate_review_draft.sh"
 PROMPT = ROOT / "prompts" / "daily_review_draft.md"
 GATE = ROOT / "scripts" / "review_draft_gate.py"
+DIAGNOSTICS = ROOT / "scripts" / "run_diagnostics.py"
 
 
 def make_brief(duplicate=False, missing_top3=False, japan_heading_only=False, japan_short=False, japan_shallow=False):
@@ -98,13 +100,14 @@ class GenerateReviewDraftTests(unittest.TestCase):
         (self.root / ".venv" / "bin").mkdir(parents=True)
         shutil.copy2(SCRIPT, self.root / "scripts" / SCRIPT.name)
         shutil.copy2(GATE, self.root / "scripts" / GATE.name)
+        shutil.copy2(DIAGNOSTICS, self.root / "scripts" / DIAGNOSTICS.name)
         shutil.copy2(PROMPT, self.root / "prompts" / PROMPT.name)
         self.fake_bin = self.root / "fake-bin"
         self.fake_bin.mkdir()
         self.calls = self.root / "codex-calls"
         self.git_marker = self.root / "git-was-called"
         self.git_marker.write_text("pre-existing dirty-worktree marker", encoding="utf-8")
-        self._write_executable(self.fake_bin / "curl", "#!/bin/sh\nexit 0\n")
+        self._write_executable(self.fake_bin / "curl", "#!/bin/sh\n[ \"${WORLD_BRIEF_TEST_NETWORK_FAIL:-0}\" = 1 ] && exit 7\nexit 0\n")
         self._write_executable(self.fake_bin / "sleep", "#!/bin/sh\nexit 0\n")
         self._write_executable(
             self.fake_bin / "date",
@@ -147,8 +150,8 @@ class GenerateReviewDraftTests(unittest.TestCase):
         )
         return (
             "#!/bin/sh\n"
-            "cat >/dev/null\n"
-            "printf x >> \"$WORLD_BRIEF_TEST_CALLS\"\n"
+            "PROMPT=$(cat)\n"
+            "printf '%s\\n' \"$PROMPT\" | sed -n 's/^SEARCH_STAGE=//p' >> \"$WORLD_BRIEF_TEST_CALLS\"\n"
             f"MODE={mode!r}\n"
             "if [ \"$MODE\" = nonzero ]; then exit 7; fi\n"
             "if [ \"$MODE\" = insufficient ]; then printf 'INSUFFICIENT_VERIFIED_ARTICLES'; exit 0; fi\n"
@@ -165,23 +168,35 @@ class GenerateReviewDraftTests(unittest.TestCase):
     def _shell_quote(self, value):
         return "'" + value.replace("'", "'\\''") + "'"
 
+    def _sequence_codex(self, sentinel_attempts):
+        payload = make_brief()
+        self._write_executable(
+            self.codex,
+            "#!/bin/sh\n"
+            "PROMPT=$(cat)\n"
+            "printf '%s\\n' \"$PROMPT\" | sed -n 's/^SEARCH_STAGE=//p' >> \"$WORLD_BRIEF_TEST_CALLS\"\n"
+            "count=$(wc -l < \"$WORLD_BRIEF_TEST_CALLS\")\n"
+            f"if [ \"$count\" -le {sentinel_attempts} ]; then printf 'INSUFFICIENT_VERIFIED_ARTICLES'; else printf '%s' {self._shell_quote(payload)}; fi\n",
+        )
+
     def _snapshot_public(self):
         return {relative: (self.root / relative).read_text(encoding="utf-8") for relative in self.public_files}
 
     def _run(self, mode="valid", python_bin=None, override=None):
-        self._write_executable(self.codex, self._codex_script(mode))
+        if mode != "custom":
+            self._write_executable(self.codex, self._codex_script(mode))
         env = os.environ.copy()
         env.update({
             "PATH": str(self.fake_bin) + os.pathsep + env.get("PATH", ""),
             "WORLD_BRIEF_CODEX_BIN": str(self.codex),
             "WORLD_BRIEF_PYTHON_BIN": str(python_bin or self.python),
-            "WORLD_BRIEF_MAX_ATTEMPTS": "4",
             "WORLD_BRIEF_TEST_CALLS": str(self.calls),
             "WORLD_BRIEF_TEST_GIT_MARKER": str(self.git_marker),
         })
         env.pop("WORLD_BRIEF_DRAFT_DIR", None)
         if override is not None:
             env["WORLD_BRIEF_DRAFT_DIR"] = override
+        env["WORLD_BRIEF_TEST_NETWORK_FAIL"] = "1" if mode == "network_unavailable" else "0"
         return subprocess.run(
             ["/bin/bash", str(self.root / "scripts" / SCRIPT.name)],
             cwd=self.root,
@@ -196,6 +211,13 @@ class GenerateReviewDraftTests(unittest.TestCase):
     def _assert_public_unchanged(self, before):
         self.assertEqual(before, self._snapshot_public())
         self.assertFalse(self.git_marker.with_name("git-was-called").read_text(encoding="utf-8") == "called")
+
+    def _assert_valid_generation_reached_renderer(self, result):
+        if result.returncode != 0:
+            self.assertIn("ModuleNotFoundError: No module named 'markdown'", result.stderr)
+            self.assertIn("SAFE_DRAFT_FAILED: html_render_failed", result.stderr)
+        record = json.loads((self.root / "logs/runs/2026-10-04/diagnostic.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["final_gate_reason"], "pass")
 
     def test_valid_output_creates_only_human_review_drafts(self):
         before = self._snapshot_public()
@@ -213,7 +235,11 @@ class GenerateReviewDraftTests(unittest.TestCase):
         self.assertIn("../style.css", html_text)
         self.assertIn('href="https://www.reuters.com/world/a"', html_text)
         self.assertIn("SAFE-AUTO-DRAFT=READY", result.stdout)
-        self.assertEqual(self.calls.read_text(encoding="utf-8"), "x")
+        run_dir = self.root / "logs/runs/2026-10-04"
+        self.assertTrue((run_dir / "attempt-1-codex-output.md").is_file())
+        self.assertTrue((run_dir / "attempt-1-gate.json").is_file())
+        self.assertTrue((run_dir / "attempt-1-candidates.json").is_file())
+        self.assertEqual(self.calls.read_text(encoding="utf-8").splitlines(), ["GENERAL"])
         self._assert_public_unchanged(before)
 
     def test_override_writes_only_to_specified_draft_directory(self):
@@ -257,7 +283,7 @@ class GenerateReviewDraftTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("top3_invalid", result.stderr)
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
-        self.assertEqual(len(self.calls.read_text(encoding="utf-8")), 4)
+        self.assertEqual(len(self.calls.read_text(encoding="utf-8").splitlines()), 1)
         self._assert_public_unchanged(before)
 
     def test_empty_japan_impact_section_fails_closed(self):
@@ -266,7 +292,7 @@ class GenerateReviewDraftTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("japan_impact_empty", result.stderr)
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
-        self.assertEqual(len(self.calls.read_text(encoding="utf-8")), 4)
+        self.assertEqual(len(self.calls.read_text(encoding="utf-8").splitlines()), 1)
         self._assert_public_unchanged(before)
 
     def test_single_short_japan_impact_sentence_fails_closed(self):
@@ -299,7 +325,16 @@ class GenerateReviewDraftTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("codex_exit_nonzero", result.stderr)
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
+        self.assertTrue((self.root / "logs/runs/2026-10-04/attempt-1-codex-output.md").is_file())
+        self.assertIn("codex_exit_nonzero", (self.root / "logs/runs/2026-10-04/attempt-1-gate.json").read_text(encoding="utf-8"))
         self._assert_public_unchanged(before)
+
+    def test_network_preflight_failure_is_distinct_and_does_not_start_search_recovery(self):
+        result = self._run("network_unavailable")
+        self.assertEqual(result.returncode, 12, result.stderr)
+        self.assertIn("network_unavailable", result.stderr)
+        self.assertFalse(self.calls.exists())
+        self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
 
     def test_empty_output_fails_closed(self):
         before = self._snapshot_public()
@@ -309,35 +344,101 @@ class GenerateReviewDraftTests(unittest.TestCase):
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
         self._assert_public_unchanged(before)
 
-    def test_exact_insufficient_sentinel_returns_no_publish_without_retry_or_writes(self):
+    def test_exact_insufficient_sentinel_advances_through_distinct_search_stages(self):
         before = self._snapshot_public()
         result = self._run("insufficient")
-        self.assertEqual(result.returncode, 10, result.stderr)
-        self.assertIn("NO_PUBLISH reason=insufficient_verified_articles", result.stdout)
-        self.assertEqual(self.calls.read_text(encoding="utf-8"), "x")
+        self.assertEqual(result.returncode, 11, result.stderr)
+        self.assertIn("RETRIEVAL_EXHAUSTED", result.stdout)
+        self.assertEqual(self.calls.read_text(encoding="utf-8").splitlines(), ["GENERAL", "TRUSTED_SOURCES", "CATEGORY_EXPANSION"])
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.html").exists())
+        run_dir = self.root / "logs/runs/2026-10-04"
+        self.assertEqual((run_dir / "attempt-1-codex-output.md").read_text(encoding="utf-8"), "INSUFFICIENT_VERIFIED_ARTICLES")
+        self.assertEqual((run_dir / "final-output.md").read_text(encoding="utf-8"), "INSUFFICIENT_VERIFIED_ARTICLES")
+        self.assertIn('"status": "UNKNOWN"', (run_dir / "candidate-diagnostics.json").read_text(encoding="utf-8"))
+        record = json.loads((run_dir / "diagnostic.json").read_text(encoding="utf-8"))
+        self.assertEqual([item["strategy"] for item in record["attempts"]], ["GENERAL", "TRUSTED_SOURCES", "CATEGORY_EXPANSION"])
+        self.assertTrue(all(item["gate_result"] == "RETRY" and item["sentinel_seen"] for item in record["attempts"]))
+        self.assertEqual([item["candidate_count"] for item in record["attempts"]], [None, None, None])
         self._assert_public_unchanged(before)
+
+    def test_general_sentinel_then_trusted_source_success_stops_after_two_stages(self):
+        self._sequence_codex(1)
+        result = self._run("custom")
+        self._assert_valid_generation_reached_renderer(result)
+        self.assertEqual(self.calls.read_text(encoding="utf-8").splitlines(), ["GENERAL", "TRUSTED_SOURCES"])
+        record = json.loads((self.root / "logs/runs/2026-10-04/diagnostic.json").read_text(encoding="utf-8"))
+        self.assertEqual([item["search_stage"] for item in record["attempts"]], ["GENERAL", "TRUSTED_SOURCES"])
+        self.assertEqual(record["attempts"][0]["query_family"], "general_world_news")
+        self.assertEqual(record["attempts"][1]["strategy"], "TRUSTED_SOURCES")
+
+    def test_two_sentinels_then_category_expansion_success(self):
+        self._sequence_codex(2)
+        result = self._run("custom")
+        self._assert_valid_generation_reached_renderer(result)
+        self.assertEqual(self.calls.read_text(encoding="utf-8").splitlines(), ["GENERAL", "TRUSTED_SOURCES", "CATEGORY_EXPANSION"])
+        record = json.loads((self.root / "logs/runs/2026-10-04/diagnostic.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["final_status"], "FAILED")  # generator records a draft run; wrapper owns publication state.
+        self.assertEqual(record["attempts"][2]["query_family"], "geopolitics_conflict|world_politics_diplomacy|economy_energy|disasters|security|science_technology")
+
+    def test_json_no_publish_envelope_saves_candidate_diagnostics_and_raw_output(self):
+        candidate = {
+            "candidate_id": "C1", "title": "One story", "source": "Reuters",
+            "url": "https://www.reuters.com/world/a", "published_at": "UNKNOWN",
+            "within_24h": "UNKNOWN", "source_verified": True, "duplicate": False,
+            "selected_for_top3": False, "rejection_reason": "outside_24h",
+        }
+        response = json.dumps({
+            "final_status": "NO_PUBLISH",
+            "brief_markdown": "INSUFFICIENT_VERIFIED_ARTICLES",
+            "candidate_diagnostics": {"coverage": "PARTIAL", "candidates": [candidate]},
+        }, ensure_ascii=False)
+        self._write_executable(
+            self.codex,
+            "#!/bin/sh\ncat >/dev/null\n"
+            f"printf '%s' {self._shell_quote(response)}\n",
+        )
+        result = self._run("custom")
+        self.assertEqual(result.returncode, 11, result.stderr)
+        run_dir = self.root / "logs/runs/2026-10-04"
+        saved = json.loads((run_dir / "candidate-diagnostics.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["status"], "RECORDED")
+        self.assertEqual(saved["coverage"], "PARTIAL")
+        self.assertEqual(saved["candidates"], [candidate])
+        self.assertIn('"candidate_diagnostics"', (run_dir / "attempt-1-codex-output.md").read_text(encoding="utf-8"))
+        self.assertEqual((run_dir / "final-output.md").read_text(encoding="utf-8"), "INSUFFICIENT_VERIFIED_ARTICLES")
+        self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
+
+    def test_gate_failure_stops_after_one_strategy_and_logs_reason(self):
+        result = self._run("invalid_date")
+        self.assertNotEqual(result.returncode, 0)
+        run_dir = self.root / "logs/runs/2026-10-04"
+        self.assertTrue((run_dir / "attempt-1-codex-output.md").is_file())
+        gate = json.loads((run_dir / "attempt-1-gate.json").read_text(encoding="utf-8"))
+        self.assertEqual(gate["gate_reason"], "date_header_invalid")
+        self.assertEqual(gate["search_stage"], "GENERAL")
+        record = json.loads((run_dir / "diagnostic.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(record["attempts"]), 1)
 
     def test_sentinel_with_extra_text_fails_closed_as_invalid_output(self):
         result = self._run("insufficient_extra")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid_output", result.stderr)
-        self.assertEqual(len(self.calls.read_text(encoding="utf-8")), 4)
+        self.assertEqual(len(self.calls.read_text(encoding="utf-8").splitlines()), 1)
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
 
     def test_typo_sentinel_fails_closed_as_invalid_output(self):
         result = self._run("insufficient_typo")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid_output", result.stderr)
-        self.assertEqual(len(self.calls.read_text(encoding="utf-8")), 4)
+        self.assertEqual(len(self.calls.read_text(encoding="utf-8").splitlines()), 1)
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
 
     def test_invalid_date_header_on_normal_draft_remains_a_gate_failure(self):
         result = self._run("invalid_date")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("date_header_invalid", result.stderr)
-        self.assertEqual(len(self.calls.read_text(encoding="utf-8")), 4)
+        self.assertEqual(len(self.calls.read_text(encoding="utf-8").splitlines()), 1)
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
 
     def test_html_render_failure_fails_before_draft_or_public_writes(self):
@@ -354,7 +455,7 @@ class GenerateReviewDraftTests(unittest.TestCase):
         result = self._run("valid", wrapper)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("html_render_failed", result.stderr)
-        self.assertEqual(self.calls.read_text(encoding="utf-8"), "x")
+        self.assertEqual(self.calls.read_text(encoding="utf-8").splitlines(), ["GENERAL"])
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.html").exists())
         self._assert_public_unchanged(before)
@@ -364,10 +465,13 @@ class GenerateReviewDraftTests(unittest.TestCase):
         self.assertIn("直近24時間", prompt)
         self.assertIn("48時間へ対象を広げてはいけません", prompt)
         self.assertIn("少なくとも3件", prompt)
-        self.assertIn("固定文 `INSUFFICIENT_VERIFIED_ARTICLES` だけ", prompt)
-        self.assertIn("この場合は日付ヘッダーを含めず", prompt)
-        self.assertIn("48時間への拡張、source件数の引き下げ", prompt)
-        self.assertIn("sentinel後の再試行", prompt)
+        self.assertIn("現在のsearch stageで公開可能なBriefを構成できなかった", prompt)
+        self.assertIn("candidate_diagnostics", prompt)
+        self.assertIn("within_24h", prompt)
+        self.assertIn('"final_status": "PUBLISH"', prompt)
+        self.assertIn("brief_markdown`を`INSUFFICIENT_VERIFIED_ARTICLES`", prompt)
+        self.assertIn("48時間への拡張、source条件の引き下げ", prompt)
+        self.assertIn("現在のsearch stage", prompt)
         self.assertIn("## 🤖 AI・テクノロジー", prompt)
         self.assertIn("## 🔬 科学", prompt)
         self.assertIn("日本との具体的な接点", prompt)

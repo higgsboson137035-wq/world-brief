@@ -1,0 +1,420 @@
+#!/usr/bin/env python3
+"""Persist one machine-readable SAFE-AUTO run record and attempt artifacts."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+import tempfile
+
+
+ROOT = Path(__file__).resolve().parent.parent
+RUNS = ROOT / "logs" / "runs"
+REASONS = {
+    "outside_24h", "missing_url", "unverifiable_source", "duplicate_url",
+    "duplicate_story", "insufficient_source_detail", "title_invalid",
+    "missing_required_section", "japan_impact_gate", "other_quality_gate",
+    "top3_not_selected", "model_returned_sentinel", "unknown",
+}
+FIELDS = (
+    "candidate_id", "title", "source", "url", "published_at", "within_24h",
+    "source_verified", "duplicate", "selected_for_top3", "rejection_reason",
+)
+SEARCH_STAGES = {
+    "GENERAL": {
+        "strategy": "GENERAL",
+        "query_family": "general_world_news",
+        "next": "TRUSTED_SOURCES",
+        "instructions": (
+            "このstageでは世界の主要ニュースを広く探す一般検索を行います。"
+            "少なくとも地域・テーマの異なる複数の一般検索を行い、記事候補と公式個別記事ページを確認してください。"
+            "3件の異なるニュースを公開基準に沿って構成できれば、このstageで終了します。"
+        ),
+    },
+    "TRUSTED_SOURCES": {
+        "strategy": "TRUSTED_SOURCES",
+        "query_family": "source_targeted_AP_REUTERS_BBC",
+        "next": "CATEGORY_EXPANSION",
+        "instructions": (
+            "このstageでは通常の一般検索を繰り返さず、AP、Reuters、BBCをそれぞれ個別のsource-oriented Web search queryで検索してください。"
+            "例：site:apnews.com/world [今日の日付] world news、site:reuters.com/world/ [今日の日付] world news、"
+            "site:bbc.com/news/world [今日の日付] latest news。各sourceへの検索を別々に行い、"
+            "いずれかのsourceが見つからない・応答しない場合も他sourceの検索を継続します。"
+            "3件の異なるニュースを公開基準に沿って構成できれば、このstageで終了します。"
+        ),
+    },
+    "CATEGORY_EXPANSION": {
+        "strategy": "CATEGORY_EXPANSION",
+        "query_family": "geopolitics_conflict|world_politics_diplomacy|economy_energy|disasters|security|science_technology",
+        "next": "NONE",
+        "instructions": (
+            "このstageでは同じ一般検索や同じsource-only検索を繰り返さず、次のカテゴリを個別のqueryに分けて探索空間を広げてください："
+            "geopolitics/conflict、world politics/diplomacy、economy/energy、major disasters、security、science/technology。"
+            "各queryには直近24時間の範囲と信頼できる媒体の個別記事を含め、少なくともAP、Reuters、BBCの複数媒体を横断してください。"
+            "各候補の記事日時・URL・sourceを確認し、既存の品質基準を満たす3件が揃えば構成してください。"
+            "このstageでsentinelを返す場合は、利用可能な検索カテゴリを探索し終えた後に限ります。"
+        ),
+    },
+}
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def run_dir(run_date: str) -> Path:
+    return RUNS / run_date
+
+
+def record_path(run_date: str) -> Path:
+    return run_dir(run_date) / "diagnostic.json"
+
+
+def atomic_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temp = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    finally:
+        if temp.exists():
+            temp.unlink()
+
+
+def atomic_copy(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+    temp = Path(name)
+    os.close(fd)
+    try:
+        shutil.copyfile(source, temp)
+        with temp.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temp, target)
+    finally:
+        if temp.exists():
+            temp.unlink()
+
+
+def load_record(run_date: str) -> dict:
+    path = record_path(run_date)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("diagnostic_record_unavailable") from exc
+    if not isinstance(value, dict) or value.get("date") != run_date:
+        raise ValueError("diagnostic_record_invalid")
+    return value
+
+
+def start_run(run_date: str) -> None:
+    directory = run_dir(run_date)
+    directory.mkdir(parents=True, exist_ok=True)
+    if record_path(run_date).exists():
+        raise ValueError("diagnostic_run_already_exists")
+    value = {
+        "schema_version": 1,
+        "date": run_date,
+        "started_at": now(),
+        "finished_at": None,
+        "final_status": "FAILED",
+        "final_run_reason": "run_incomplete",
+        "codex_exit_code": None,
+        "attempts": [],
+        "attempt_count": 0,
+        "sentinel_seen": False,
+        "final_gate_result": "UNKNOWN",
+        "final_gate_reason": "run_incomplete",
+        "candidate_diagnostics_status": "UNKNOWN",
+        "candidate_diagnostics_coverage": "UNKNOWN",
+        "candidate_diagnostics": [],
+        "search_stage": None,
+        "search_strategy": None,
+        "query_family": None,
+        "candidate_count": None,
+        "human_review_required": False,
+        "draft_saved": False,
+        "publish_started": False,
+        "commit_created": False,
+        "commit_type": None,
+        "push_attempted": False,
+        "push_result": "NOT_ATTEMPTED",
+    }
+    atomic_json(record_path(run_date), value)
+
+
+def record_attempt(
+    run_date: str, number: int, codex_exit_code: int, gate_result: str,
+    gate_reason: str, sentinel_seen: bool, candidate_status: str,
+    raw_output: Path, candidate_output: Path,
+    gate_output: Path, search_stage: str, strategy: str, query_family: str,
+) -> None:
+    value = load_record(run_date)
+    directory = run_dir(run_date)
+    raw_target = directory / f"attempt-{number}-codex-output.md"
+    final_target = directory / f"attempt-{number}-final-output.md"
+    candidate_target = directory / f"attempt-{number}-candidates.json"
+    gate_target = directory / f"attempt-{number}-gate.json"
+    atomic_copy(raw_output, raw_target)
+    atomic_copy(gate_output, final_target)
+    try:
+        candidates = json.loads(candidate_output.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        candidates = {"status": "UNKNOWN", "coverage": "UNKNOWN", "candidates": []}
+        candidate_status = "UNKNOWN"
+    atomic_json(candidate_target, candidates)
+    atomic_json(directory / "candidate-diagnostics.json", candidates)
+    atomic_copy(final_target, directory / "final-output.md")
+    gate = {
+        "attempt": number,
+        "search_stage": search_stage,
+        "strategy": strategy,
+        "query_family": query_family,
+        "candidate_count": (len(candidates.get("candidates", []))
+                            if candidate_status == "RECORDED" else None),
+        "codex_exit_code": codex_exit_code,
+        "gate_result": gate_result,
+        "gate_reason": gate_reason,
+        "sentinel_seen": sentinel_seen,
+        "candidate_diagnostics_status": candidate_status,
+    }
+    atomic_json(gate_target, gate)
+    attempts = [item for item in value.get("attempts", []) if item.get("attempt") != number]
+    attempts.append({
+        **gate,
+        "raw_output": raw_target.name,
+        "final_output": final_target.name,
+        "gate_record": gate_target.name,
+        "candidate_diagnostics": candidate_target.name,
+    })
+    attempts.sort(key=lambda item: item["attempt"])
+    value["attempts"] = attempts
+    value["attempt_count"] = len(attempts)
+    value["codex_exit_code"] = codex_exit_code
+    value["sentinel_seen"] = bool(value.get("sentinel_seen")) or sentinel_seen
+    value["final_gate_result"] = gate_result
+    value["final_gate_reason"] = gate_reason
+    value["candidate_diagnostics_status"] = candidate_status
+    value["candidate_diagnostics"] = candidates.get("candidates", [])
+    value["candidate_diagnostics_coverage"] = candidates.get("coverage", "UNKNOWN")
+    value["search_stage"] = search_stage
+    value["search_strategy"] = strategy
+    value["query_family"] = query_family
+    value["candidate_count"] = gate["candidate_count"]
+    atomic_json(record_path(run_date), value)
+
+
+def finalize(run_date: str, args: argparse.Namespace) -> None:
+    value = load_record(run_date)
+    prior_gate_reason = value.get("final_gate_reason", "UNKNOWN")
+    final_gate_reason = args.gate_reason
+    if (args.final_status == "FAILED"
+            and args.gate_reason in {"draft_generation_or_quality_gate_failed", "draft_publish_failed"}
+            and prior_gate_reason not in {None, "UNKNOWN", "run_incomplete"}):
+        final_gate_reason = prior_gate_reason
+    if args.final_status == "FAILED" and not value.get("attempts"):
+        final_gate_reason = "UNKNOWN"
+    value.update({
+        "finished_at": now(),
+        "final_status": args.final_status,
+        "final_gate_result": args.gate_result,
+        "final_gate_reason": final_gate_reason,
+        "final_run_reason": args.gate_reason,
+        "draft_saved": args.draft_saved,
+        "publish_started": args.publish_started,
+        "commit_created": args.commit_created,
+        "commit_type": args.commit_type,
+        "push_attempted": args.push_attempted,
+        "push_result": args.push_result,
+        "human_review_required": args.human_review_required,
+    })
+    if args.codex_exit_code is not None:
+        value["codex_exit_code"] = args.codex_exit_code
+    if args.sentinel_seen:
+        value["sentinel_seen"] = True
+    atomic_json(record_path(run_date), value)
+
+
+def mark(run_date: str, **values: object) -> None:
+    value = load_record(run_date)
+    value.update(values)
+    atomic_json(record_path(run_date), value)
+
+
+def validate_candidate(candidate: object) -> dict:
+    if not isinstance(candidate, dict) or any(field not in candidate for field in FIELDS):
+        raise ValueError("candidate_diagnostic_schema_invalid")
+    result = dict(candidate)
+    for field in ("candidate_id", "title", "source", "url", "published_at"):
+        if result[field] is not None and not isinstance(result[field], str):
+            raise ValueError("candidate_diagnostic_schema_invalid")
+    for field in ("within_24h", "source_verified", "duplicate", "selected_for_top3"):
+        item = result[field]
+        if not (type(item) is bool or item == "UNKNOWN"):
+            raise ValueError("candidate_diagnostic_schema_invalid")
+    reason = result["rejection_reason"]
+    if reason is not None and (not isinstance(reason, str) or reason not in REASONS):
+        raise ValueError("candidate_diagnostic_reason_invalid")
+    return result
+
+
+def extract_response(raw_path: Path, brief_path: Path, candidates_path: Path) -> tuple[str, str]:
+    """Split the JSON response envelope; preserve legacy text as UNKNOWN diagnostics."""
+    raw = raw_path.read_text(encoding="utf-8")
+    stripped = raw.strip()
+    if stripped == "INSUFFICIENT_VERIFIED_ARTICLES":
+        brief_path.write_text("INSUFFICIENT_VERIFIED_ARTICLES", encoding="utf-8")
+        atomic_json(candidates_path, {"status": "UNKNOWN", "coverage": "UNKNOWN", "candidates": []})
+        return "NO_PUBLISH", "UNKNOWN"
+    if stripped.startswith("{"):
+        try:
+            envelope = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            raise ValueError("diagnostic_output_invalid_json") from exc
+        if not isinstance(envelope, dict) or envelope.get("final_status") not in {"PUBLISH", "NO_PUBLISH"}:
+            raise ValueError("diagnostic_output_schema_invalid")
+        diagnostic_block = envelope.get("candidate_diagnostics")
+        if diagnostic_block is None:
+            diagnostics = []
+            diag_status = "UNKNOWN"
+            coverage = "UNKNOWN"
+        elif not isinstance(diagnostic_block, dict):
+            raise ValueError("diagnostic_output_schema_invalid")
+        else:
+            diagnostics = diagnostic_block.get("candidates")
+            coverage = diagnostic_block.get("coverage", "UNKNOWN")
+            if coverage not in {"COMPLETE", "PARTIAL", "UNKNOWN"} or not isinstance(diagnostics, list):
+                raise ValueError("diagnostic_output_schema_invalid")
+            diagnostics = [validate_candidate(candidate) for candidate in diagnostics]
+            diag_status = "RECORDED"
+        body = envelope.get("brief_markdown")
+        if envelope["final_status"] == "NO_PUBLISH":
+            if body not in (None, "INSUFFICIENT_VERIFIED_ARTICLES"):
+                raise ValueError("diagnostic_output_status_conflict")
+            body = "INSUFFICIENT_VERIFIED_ARTICLES"
+        elif not isinstance(body, str):
+            raise ValueError("diagnostic_output_brief_missing")
+        elif body.strip() == "INSUFFICIENT_VERIFIED_ARTICLES":
+            raise ValueError("diagnostic_output_status_conflict")
+        brief_path.write_text(body, encoding="utf-8")
+        atomic_json(candidates_path, {
+            "status": diag_status,
+            "coverage": coverage,
+            "candidates": diagnostics,
+        })
+        return envelope["final_status"], diag_status
+    # Compatibility for existing model output; diagnostics are explicitly UNKNOWN.
+    brief_path.write_text(raw, encoding="utf-8")
+    atomic_json(candidates_path, {"status": "UNKNOWN", "coverage": "UNKNOWN", "candidates": []})
+    return ("NO_PUBLISH" if stripped == "INSUFFICIENT_VERIFIED_ARTICLES" else "PUBLISH"), "UNKNOWN"
+
+
+def render_prompt(template_path: Path, output_path: Path, stage: str) -> None:
+    try:
+        template = template_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError("prompt_unreadable") from exc
+    if stage not in SEARCH_STAGES:
+        raise ValueError("search_stage_invalid")
+    values = SEARCH_STAGES[stage]
+    replacements = {
+        "__SEARCH_STAGE__": stage,
+        "__SEARCH_STRATEGY__": values["strategy"],
+        "__SEARCH_QUERY_FAMILY__": values["query_family"],
+        "__NEXT_SEARCH_STAGE__": values["next"],
+        "__SEARCH_STAGE_INSTRUCTIONS__": values["instructions"],
+        "__MAX_SEARCH_STAGE__": str(len(SEARCH_STAGES)),
+    }
+    for marker, replacement in replacements.items():
+        if template.count(marker) != 1:
+            raise ValueError("prompt_stage_placeholder_invalid")
+        template = template.replace(marker, replacement)
+    output_path.write_text(template, encoding="utf-8")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command", required=True)
+    start = sub.add_parser("start")
+    start.add_argument("date")
+    attempt = sub.add_parser("attempt")
+    attempt.add_argument("date")
+    attempt.add_argument("number", type=int)
+    attempt.add_argument("codex_exit_code", type=int)
+    attempt.add_argument("gate_result")
+    attempt.add_argument("gate_reason")
+    attempt.add_argument("sentinel_seen", choices=("true", "false"))
+    attempt.add_argument("candidate_status")
+    attempt.add_argument("raw_output", type=Path)
+    attempt.add_argument("candidate_output", type=Path)
+    attempt.add_argument("gate_output", type=Path)
+    attempt.add_argument("search_stage")
+    attempt.add_argument("strategy")
+    attempt.add_argument("query_family")
+    extract = sub.add_parser("extract")
+    extract.add_argument("raw_output", type=Path)
+    extract.add_argument("brief_output", type=Path)
+    extract.add_argument("candidate_output", type=Path)
+    render = sub.add_parser("render-prompt")
+    render.add_argument("template", type=Path)
+    render.add_argument("output", type=Path)
+    render.add_argument("stage", choices=tuple(SEARCH_STAGES))
+    marker = sub.add_parser("mark")
+    marker.add_argument("date")
+    marker.add_argument("key", choices=("publish_started",))
+    marker.add_argument("value", choices=("true",))
+    finish = sub.add_parser("finish")
+    finish.add_argument("date")
+    finish.add_argument("final_status", choices=("PUBLISH", "NO_PUBLISH", "FAILED", "RETRIEVAL_EXHAUSTED"))
+    finish.add_argument("gate_result")
+    finish.add_argument("gate_reason")
+    finish.add_argument("--codex-exit-code", type=int)
+    for flag in ("draft-saved", "publish-started", "commit-created", "push-attempted", "sentinel-seen"):
+        finish.add_argument(f"--{flag}", action="store_true")
+    finish.add_argument("--commit-type", default=None)
+    finish.add_argument("--push-result", default="NOT_ATTEMPTED")
+    finish.add_argument("--human-review-required", action="store_true")
+    args = parser.parse_args()
+    try:
+        if args.command == "start":
+            start_run(args.date)
+        elif args.command == "attempt":
+            record_attempt(args.date, args.number, args.codex_exit_code, args.gate_result,
+                           args.gate_reason, args.sentinel_seen == "true", args.candidate_status,
+                           args.raw_output, args.candidate_output, args.gate_output,
+                           args.search_stage, args.strategy, args.query_family)
+        elif args.command == "extract":
+            status, diag = extract_response(args.raw_output, args.brief_output, args.candidate_output)
+            print(f"{status} {diag}")
+        elif args.command == "mark":
+            mark(args.date, **{args.key: args.value == "true"})
+        elif args.command == "render-prompt":
+            render_prompt(args.template, args.output, args.stage)
+        else:
+            finalize(args.date, argparse.Namespace(
+                final_status=args.final_status, gate_result=args.gate_result,
+                gate_reason=args.gate_reason, codex_exit_code=args.codex_exit_code,
+                draft_saved=args.draft_saved, publish_started=args.publish_started,
+                commit_created=args.commit_created, push_attempted=args.push_attempted,
+                push_result=args.push_result, commit_type=args.commit_type,
+                sentinel_seen=args.sentinel_seen,
+                human_review_required=args.human_review_required,
+            ))
+    except (OSError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

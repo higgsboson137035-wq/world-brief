@@ -74,6 +74,11 @@ class RecordNoPublishTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_current_index_uses_neutral_no_publish_copy(self):
+        index = (Path(__file__).resolve().parents[1] / "index.html").read_text(encoding="utf-8")
+        self.assertIn("本日の自動選定では、公開基準を満たすWorld Briefを構成できなかったため、公開を見送りました。", index)
+        self.assertNotIn("直近24時間の情報から、所定の確認基準を満たす記事を十分に確保できなかったためです。", index)
+
     def _git(self, *args: str) -> str:
         return subprocess.run(
             ["git", *args], cwd=self.root, env=self.env, text=True,
@@ -94,7 +99,7 @@ class RecordNoPublishTests(unittest.TestCase):
         index = self.index.read_text(encoding="utf-8")
         self.assertIn("状態更新: 2026-10-25", index)
         self.assertIn("2026年10月25日 — 本日は品質基準により公開なし", index)
-        self.assertIn("所定の確認基準を満たす記事を十分に確保できなかったため", index)
+        self.assertIn("本日の自動選定では、公開基準を満たすWorld Briefを構成できなかったため、公開を見送りました。", index)
         self.assertIn('<a href="2026-10-24.html">2026年10月24日版 World Brief</a>', index)
         self.assertIn("<h2>最新の公開記事 — 2026年10月24日</h2>", index)
         self.assertNotIn("Date: 2026-10-24", index)

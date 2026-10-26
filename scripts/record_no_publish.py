@@ -84,7 +84,7 @@ def status_block(run_date: str, latest_date: str) -> str:
         'border-radius:8px;background:#f8fafc;padding:1rem 1.25rem;margin:1.25rem 0">',
         "<h2>本日の状態</h2>",
         f"<p><strong>{run_label} — 本日は品質基準により公開なし</strong></p>",
-        "<p>直近24時間の情報から、所定の確認基準を満たす記事を十分に確保できなかったためです。</p>",
+        "<p>本日の自動選定では、公開基準を満たすWorld Briefを構成できなかったため、公開を見送りました。</p>",
         f'<p>最新の公開記事：<a href="{latest_date}.html">{latest_label}版 World Brief</a></p>',
         "</section>",
         STATUS_END,
