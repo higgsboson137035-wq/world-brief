@@ -8,6 +8,21 @@ RUN_DATE="$(date +%F)"
 export WORLD_BRIEF_RUN_DATE="$RUN_DATE"
 DIAGNOSTICS="$ROOT/scripts/run_diagnostics.py"
 PYTHON_BIN="${WORLD_BRIEF_PYTHON_BIN:-$ROOT/.venv/bin/python}"
+ALLOW_RERUN="${WORLD_BRIEF_ALLOW_RERUN:-0}"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+    printf 'AUTO-PUBLISH=FAILED reason=project_python_unavailable\n' >&2
+    exit 1
+fi
+if RUN_SELECTION="$("$PYTHON_BIN" -B "$DIAGNOSTICS" prepare "$RUN_DATE" "$ALLOW_RERUN" \
+    "$ROOT/briefs/$RUN_DATE.md" "$ROOT/$RUN_DATE.html" 2>&1)"; then
+    read -r RUN_ID RUN_TRIGGER PREVIOUS_RUN_STATUS <<< "$RUN_SELECTION"
+else
+    printf 'AUTO-PUBLISH=FAILED reason=%s\n' "$RUN_SELECTION" >&2
+    exit 1
+fi
+export WORLD_BRIEF_RUN_ID="$RUN_ID"
+export WORLD_BRIEF_TRIGGER="$RUN_TRIGGER"
+export WORLD_BRIEF_PREVIOUS_RUN_STATUS="$PREVIOUS_RUN_STATUS"
 DIAGNOSTIC_STARTED=0
 PUBLISH_STARTED=0
 DRAFT_SAVED=0
@@ -19,7 +34,7 @@ GATE_RESULT="UNKNOWN"
 
 finish_run() {
     local status="$1" reason="$2" human_review="${3:-false}"
-    local args=("$RUN_DATE" "$status" "$GATE_RESULT" "$reason")
+    local args=("$RUN_DATE" "$status" "$GATE_RESULT" "$reason" --run-id "$RUN_ID")
     [[ "$DRAFT_SAVED" -eq 1 ]] && args+=(--draft-saved)
     [[ "$PUBLISH_STARTED" -eq 1 ]] && args+=(--publish-started)
     [[ "$COMMIT_CREATED" -eq 1 ]] && args+=(--commit-created)
@@ -39,9 +54,8 @@ fail() {
     exit 1
 }
 
-if [[ ! -x "$PYTHON_BIN" ]]; then fail "project_python_unavailable"; fi
-
-if ! "$PYTHON_BIN" -B "$DIAGNOSTICS" start "$RUN_DATE"; then
+if ! "$PYTHON_BIN" -B "$DIAGNOSTICS" start "$RUN_DATE" \
+    --run-id "$RUN_ID" --trigger "$RUN_TRIGGER" --previous-run-status "$PREVIOUS_RUN_STATUS"; then
     fail "diagnostic_run_start_failed"
 fi
 DIAGNOSTIC_STARTED=1
@@ -72,7 +86,8 @@ else
 fi
 DRAFT_SAVED=1
 
-"$PYTHON_BIN" -B "$DIAGNOSTICS" mark "$RUN_DATE" publish_started true || fail "diagnostic_publish_mark_failed"
+"$PYTHON_BIN" -B "$DIAGNOSTICS" mark "$RUN_DATE" publish_started true \
+    --run-id "$RUN_ID" || fail "diagnostic_publish_mark_failed"
 PUBLISH_STARTED=1
 if PUBLISH_OUTPUT="$("$PYTHON_BIN" -B "$ROOT/scripts/publish_auto_draft.py" 2>&1)"; then
     printf '%s\n' "$PUBLISH_OUTPUT"

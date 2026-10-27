@@ -10,6 +10,9 @@ fail() {
 }
 
 TODAY="${WORLD_BRIEF_RUN_DATE:-$(date +%F)}"
+RUN_ID="${WORLD_BRIEF_RUN_ID:-run-01}"
+RUN_TRIGGER="${WORLD_BRIEF_TRIGGER:-scheduled}"
+PREVIOUS_RUN_STATUS="${WORLD_BRIEF_PREVIOUS_RUN_STATUS:-NONE}"
 DRAFT_DIR_OVERRIDE="${WORLD_BRIEF_DRAFT_DIR:-}"
 if [[ -z "$DRAFT_DIR_OVERRIDE" ]]; then
     DRAFT_DIR="$ROOT/drafts"
@@ -59,9 +62,12 @@ STAGED_MD="$WORK_DIR/review-draft.md"
 STAGED_HTML="$WORK_DIR/review-draft.html"
 DIAGNOSTICS="$ROOT/scripts/run_diagnostics.py"
 FORMAT_REPAIR="$ROOT/scripts/format_repair.py"
+RUN_DIAGNOSTIC_DIR="$ROOT/logs/runs/$TODAY"
+if [[ "$RUN_ID" == "run-02" ]]; then RUN_DIAGNOSTIC_DIR="$RUN_DIAGNOSTIC_DIR/run-02"; fi
 
-if [[ ! -f "$ROOT/logs/runs/$TODAY/diagnostic.json" ]]; then
-    "$PYTHON_BIN" -B "$DIAGNOSTICS" start "$TODAY" || fail "diagnostic_run_start_failed"
+if [[ ! -f "$RUN_DIAGNOSTIC_DIR/diagnostic.json" ]]; then
+    "$PYTHON_BIN" -B "$DIAGNOSTICS" start "$TODAY" --run-id "$RUN_ID" \
+        --trigger "$RUN_TRIGGER" --previous-run-status "$PREVIOUS_RUN_STATUS" || fail "diagnostic_run_start_failed"
 fi
 
 printf 'Checking network availability...\n'
@@ -201,7 +207,8 @@ for STAGE in GENERAL TRUSTED_SOURCES CATEGORY_EXPANSION; do
         --format-repair-result "$FORMAT_REPAIR_RESULT" \
         --repaired-gate-result "$REPAIRED_GATE_RESULT" \
         --repaired-gate-reason "$REPAIRED_GATE_REASON" \
-        --repaired-output "$REPAIRED_OUTPUT" || fail "diagnostic_attempt_save_failed"
+        --repaired-output "$REPAIRED_OUTPUT" \
+        --run-id "$RUN_ID" || fail "diagnostic_attempt_save_failed"
 
     if [[ "$FAILURE_REASON" == "pass" ]]; then
         BRIEF_VALID=1

@@ -67,12 +67,16 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def run_dir(run_date: str) -> Path:
-    return RUNS / run_date
+def run_dir(run_date: str, run_id: str | None = None) -> Path:
+    run_id = run_id or "run-01"
+    if run_id not in {"run-01", "run-02"}:
+        raise ValueError("diagnostic_run_id_invalid")
+    directory = RUNS / run_date
+    return directory if run_id == "run-01" else directory / run_id
 
 
-def record_path(run_date: str) -> Path:
-    return run_dir(run_date) / "diagnostic.json"
+def record_path(run_date: str, run_id: str | None = None) -> Path:
+    return run_dir(run_date, run_id) / "diagnostic.json"
 
 
 def atomic_json(path: Path, value: object) -> None:
@@ -106,25 +110,81 @@ def atomic_copy(source: Path, target: Path) -> None:
             temp.unlink()
 
 
-def load_record(run_date: str) -> dict:
-    path = record_path(run_date)
+def load_record(run_date: str, run_id: str | None = None) -> dict:
+    normalized_run_id = run_id or "run-01"
+    path = record_path(run_date, normalized_run_id)
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError("diagnostic_record_unavailable") from exc
-    if not isinstance(value, dict) or value.get("date") != run_date:
+    if (not isinstance(value, dict) or value.get("date") != run_date
+            or value.get("run_id", "run-01") != normalized_run_id):
         raise ValueError("diagnostic_record_invalid")
     return value
 
 
-def start_run(run_date: str) -> None:
-    directory = run_dir(run_date)
+def select_run(
+    run_date: str, allow_rerun: str,
+    published_markdown: Path, published_html: Path,
+) -> tuple[str, str, str | None]:
+    if allow_rerun not in {"0", "1"}:
+        raise ValueError("rerun_flag_invalid")
+    first_path = record_path(run_date, "run-01")
+    second_directory = run_dir(run_date, "run-02")
+    if not first_path.exists():
+        if allow_rerun == "1":
+            raise ValueError("rerun_previous_run_missing")
+        if second_directory.exists():
+            raise ValueError("diagnostic_run_state_unknown")
+        return "run-01", "scheduled", None
+    if allow_rerun != "1":
+        raise ValueError("diagnostic_run_already_exists")
+
+    previous = load_record(run_date, "run-01")
+    if not previous.get("finished_at"):
+        raise ValueError("diagnostic_run_in_progress")
+    previous_status = previous.get("final_status")
+    if previous_status not in {"FAILED", "RETRIEVAL_EXHAUSTED"}:
+        raise ValueError("rerun_previous_status_not_eligible")
+    if published_markdown.exists() or published_html.exists():
+        raise ValueError("published_artifact_exists")
+    if second_directory.exists():
+        raise ValueError("diagnostic_run_already_exists")
+    return "run-02", "human_rerun", previous_status
+
+
+def start_run(
+    run_date: str, run_id: str = "run-01", trigger: str = "scheduled",
+    previous_run_status: str | None = None,
+) -> None:
+    if trigger not in {"scheduled", "human_rerun"}:
+        raise ValueError("diagnostic_trigger_invalid")
+    if run_id == "run-01":
+        if trigger != "scheduled" or previous_run_status is not None:
+            raise ValueError("diagnostic_run_metadata_invalid")
+    elif run_id == "run-02":
+        selected_id, selected_trigger, selected_previous = select_run(
+            run_date, "1", ROOT / "briefs" / f"{run_date}.md",
+            ROOT / f"{run_date}.html",
+        )
+        if (selected_id, selected_trigger, selected_previous) != (
+            run_id, trigger, previous_run_status
+        ):
+            raise ValueError("diagnostic_run_metadata_invalid")
+    else:
+        raise ValueError("diagnostic_run_id_invalid")
+    directory = run_dir(run_date, run_id)
+    if run_id == "run-02" and directory.exists():
+        raise ValueError("diagnostic_run_already_exists")
     directory.mkdir(parents=True, exist_ok=True)
-    if record_path(run_date).exists():
+    if record_path(run_date, run_id).exists():
         raise ValueError("diagnostic_run_already_exists")
     value = {
-        "schema_version": 1,
+        "schema_version": 2,
         "date": run_date,
+        "run_id": run_id,
+        "trigger": trigger,
+        "previous_run_status": previous_run_status,
         "started_at": now(),
         "finished_at": None,
         "final_status": "FAILED",
@@ -156,7 +216,7 @@ def start_run(run_date: str) -> None:
         "push_attempted": False,
         "push_result": "NOT_ATTEMPTED",
     }
-    atomic_json(record_path(run_date), value)
+    atomic_json(record_path(run_date, run_id), value)
 
 
 def record_attempt(
@@ -165,10 +225,10 @@ def record_attempt(
     raw_output: Path, candidate_output: Path,
     gate_output: Path, search_stage: str, strategy: str, query_family: str,
     original_output: Path | None = None, repaired_output: Path | None = None,
-    repair_metadata: dict | None = None,
+    repair_metadata: dict | None = None, run_id: str = "run-01",
 ) -> None:
-    value = load_record(run_date)
-    directory = run_dir(run_date)
+    value = load_record(run_date, run_id)
+    directory = run_dir(run_date, run_id)
     raw_target = directory / f"attempt-{number}-codex-output.md"
     final_target = directory / f"attempt-{number}-final-output.md"
     candidate_target = directory / f"attempt-{number}-candidates.json"
@@ -244,11 +304,12 @@ def record_attempt(
     value["search_strategy"] = strategy
     value["query_family"] = query_family
     value["candidate_count"] = gate["candidate_count"]
-    atomic_json(record_path(run_date), value)
+    atomic_json(record_path(run_date, run_id), value)
 
 
 def finalize(run_date: str, args: argparse.Namespace) -> None:
-    value = load_record(run_date)
+    run_id = getattr(args, "run_id", "run-01")
+    value = load_record(run_date, run_id)
     prior_gate_reason = value.get("final_gate_reason", "UNKNOWN")
     final_gate_reason = args.gate_reason
     if (args.final_status == "FAILED"
@@ -275,13 +336,13 @@ def finalize(run_date: str, args: argparse.Namespace) -> None:
         value["codex_exit_code"] = args.codex_exit_code
     if args.sentinel_seen:
         value["sentinel_seen"] = True
-    atomic_json(record_path(run_date), value)
+    atomic_json(record_path(run_date, run_id), value)
 
 
-def mark(run_date: str, **values: object) -> None:
-    value = load_record(run_date)
+def mark(run_date: str, run_id: str = "run-01", **values: object) -> None:
+    value = load_record(run_date, run_id)
     value.update(values)
-    atomic_json(record_path(run_date), value)
+    atomic_json(record_path(run_date, run_id), value)
 
 
 def validate_candidate(candidate: object) -> dict:
@@ -380,6 +441,14 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     start = sub.add_parser("start")
     start.add_argument("date")
+    start.add_argument("--run-id", choices=("run-01", "run-02"), default="run-01")
+    start.add_argument("--trigger", choices=("scheduled", "human_rerun"), default="scheduled")
+    start.add_argument("--previous-run-status", choices=("NONE", "FAILED", "RETRIEVAL_EXHAUSTED"), default="NONE")
+    prepare = sub.add_parser("prepare")
+    prepare.add_argument("date")
+    prepare.add_argument("allow_rerun", choices=("0", "1"))
+    prepare.add_argument("published_markdown", type=Path)
+    prepare.add_argument("published_html", type=Path)
     attempt = sub.add_parser("attempt")
     attempt.add_argument("date")
     attempt.add_argument("number", type=int)
@@ -394,6 +463,7 @@ def main() -> int:
     attempt.add_argument("search_stage")
     attempt.add_argument("strategy")
     attempt.add_argument("query_family")
+    attempt.add_argument("--run-id", choices=("run-01", "run-02"), default="run-01")
     attempt.add_argument("--original-output", type=Path)
     attempt.add_argument("--repaired-output", type=Path)
     attempt.add_argument("--original-gate-result", default="UNKNOWN")
@@ -414,8 +484,10 @@ def main() -> int:
     marker.add_argument("date")
     marker.add_argument("key", choices=("publish_started",))
     marker.add_argument("value", choices=("true",))
+    marker.add_argument("--run-id", choices=("run-01", "run-02"), default="run-01")
     finish = sub.add_parser("finish")
     finish.add_argument("date")
+    finish.add_argument("--run-id", choices=("run-01", "run-02"), default="run-01")
     finish.add_argument("final_status", choices=("PUBLISH", "NO_PUBLISH", "FAILED", "RETRIEVAL_EXHAUSTED"))
     finish.add_argument("gate_result")
     finish.add_argument("gate_reason")
@@ -428,7 +500,13 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.command == "start":
-            start_run(args.date)
+            previous = None if args.previous_run_status == "NONE" else args.previous_run_status
+            start_run(args.date, args.run_id, args.trigger, previous)
+        elif args.command == "prepare":
+            run_id, trigger, previous = select_run(
+                args.date, args.allow_rerun, args.published_markdown, args.published_html,
+            )
+            print(f"{run_id} {trigger} {previous or 'NONE'}")
         elif args.command == "attempt":
             repair_metadata = {
                 "original_gate_result": args.original_gate_result,
@@ -442,16 +520,18 @@ def main() -> int:
                            args.gate_reason, args.sentinel_seen == "true", args.candidate_status,
                            args.raw_output, args.candidate_output, args.gate_output,
                            args.search_stage, args.strategy, args.query_family,
-                           args.original_output, args.repaired_output, repair_metadata)
+                           args.original_output, args.repaired_output, repair_metadata,
+                           args.run_id)
         elif args.command == "extract":
             status, diag = extract_response(args.raw_output, args.brief_output, args.candidate_output)
             print(f"{status} {diag}")
         elif args.command == "mark":
-            mark(args.date, **{args.key: args.value == "true"})
+            mark(args.date, args.run_id, **{args.key: args.value == "true"})
         elif args.command == "render-prompt":
             render_prompt(args.template, args.output, args.stage)
         else:
             finalize(args.date, argparse.Namespace(
+                run_id=args.run_id,
                 final_status=args.final_status, gate_result=args.gate_result,
                 gate_reason=args.gate_reason, codex_exit_code=args.codex_exit_code,
                 draft_saved=args.draft_saved, publish_started=args.publish_started,
