@@ -161,6 +161,60 @@ class RunDiagnosticsTests(unittest.TestCase):
         self.assertEqual(record["final_status"], "RETRIEVAL_EXHAUSTED")
         self.assertTrue(record["human_review_required"])
 
+    def test_contract_repair_metadata_and_all_output_stages_are_saved(self):
+        diagnostics.start_run(self.run_date)
+        root = Path(self.temp.name)
+        raw = root / "raw.json"
+        candidate = root / "candidate.json"
+        gate = root / "gate.md"
+        original_json = root / "original.json"
+        repaired_json = root / "repaired.json"
+        original_brief = root / "original-brief.md"
+        repaired_brief = root / "contract-repaired-brief.md"
+        format_brief = root / "format-repaired-brief.md"
+        raw.write_text('{"final_status":"PUBLISH"}', encoding="utf-8")
+        original_json.write_text(raw.read_text(encoding="utf-8"), encoding="utf-8")
+        repaired_json.write_text('{"final_status":"PUBLISH","repaired":true}', encoding="utf-8")
+        original_brief.write_text("## Candidate Diagnostics\n", encoding="utf-8")
+        repaired_brief.write_text("Human-readable brief", encoding="utf-8")
+        format_brief.write_text("Format-repaired brief", encoding="utf-8")
+        candidate.write_text('{"status":"RECORDED","coverage":"PARTIAL","candidates":[]}', encoding="utf-8")
+        gate.write_text("pass", encoding="utf-8")
+        diagnostics.record_attempt(
+            self.run_date, 1, 0, "PASS", "pass", False, "RECORDED",
+            raw, candidate, gate, "GENERAL", "GENERAL", "general_world_news",
+            original_output=repaired_brief, repaired_output=format_brief,
+            repair_metadata={"original_gate_result": "FAIL", "original_gate_reason": "required_heading_order_invalid",
+                             "format_repair_attempted": True, "format_repair_result": "PASS",
+                             "repaired_gate_result": "PASS", "repaired_gate_reason": "pass"},
+            contract_metadata={"json_contract_result": "PASS", "json_contract_reason": "diagnostics_removed",
+                               "contract_repair_attempted": True, "contract_repair_result": "PASS",
+                               "contract_repair_reason": "candidate_diagnostics_embedded_in_brief_markdown"},
+            original_json_output=original_json, contract_repaired_json=repaired_json,
+            contract_original_brief=original_brief, contract_repaired_brief=repaired_brief,
+        )
+        directory = diagnostics.run_dir(self.run_date)
+        record = json.loads(diagnostics.record_path(self.run_date).read_text(encoding="utf-8"))
+        attempt = json.loads((directory / "attempt-1-gate.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["json_contract_result"], "PASS")
+        self.assertEqual(record["json_contract_reason"], "diagnostics_removed")
+        self.assertTrue(record["contract_repair_attempted"])
+        self.assertEqual(record["contract_repair_result"], "PASS")
+        self.assertEqual(record["contract_repair_reason"], "candidate_diagnostics_embedded_in_brief_markdown")
+        for artifact in (
+            "attempt-1-original-json-output.json",
+            "attempt-1-contract-repaired-json.json",
+            "attempt-1-original-brief-markdown.md",
+            "attempt-1-contract-repaired-brief-markdown.md",
+            "attempt-1-format-repaired-brief-markdown.md",
+        ):
+            self.assertTrue((directory / artifact).is_file(), artifact)
+        self.assertEqual(attempt["original_json_output"], "attempt-1-original-json-output.json")
+        self.assertEqual(attempt["contract_repaired_json"], "attempt-1-contract-repaired-json.json")
+        self.assertEqual(attempt["contract_original_brief_markdown"], "attempt-1-original-brief-markdown.md")
+        self.assertEqual(attempt["contract_repaired_brief_markdown"], "attempt-1-contract-repaired-brief-markdown.md")
+        self.assertEqual(attempt["format_repaired_brief_markdown"], "attempt-1-format-repaired-brief-markdown.md")
+
     def test_rendered_trusted_source_prompt_has_individual_queries_and_no_template_markers(self):
         template = Path(__file__).resolve().parents[1] / "prompts/daily_review_draft.md"
         rendered = Path(self.temp.name) / "trusted.md"

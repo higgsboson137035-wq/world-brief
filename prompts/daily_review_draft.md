@@ -79,6 +79,29 @@ Tomorrow's Watchlistは3〜5項目。全体を落ち着いた日本語で簡潔�
 
 PUBLISHの場合は`final_status`を`PUBLISH`、`brief_markdown`を完成Briefとします。NO_PUBLISHの場合は`final_status`を`NO_PUBLISH`、`brief_markdown`を`INSUFFICIENT_VERIFIED_ARTICLES`とします。`candidate_diagnostics.coverage`は`COMPLETE`、`PARTIAL`、`UNKNOWN`のいずれかです。候補診断は別フィールドに必ず含め、NO_PUBLISH時にも省略しません。JSON文字列内の改行や引用符は正しくescapeしてください。
 
+field分離は厳守してください。`brief_markdown`にはHumanが読むWorld Brief本文だけを入れ、候補診断、候補一覧、検索過程、候補選定過程、JSON診断内容の説明を絶対に含めません。候補診断は`candidate_diagnostics` fieldだけに格納し、本文へコピー・要約・表として再掲しません。
+
+`brief_markdown`内では、次の診断見出し・field名・値・表を禁止します。これらはすべて`candidate_diagnostics` fieldだけに出力してください。
+
+- `## Candidate Diagnostics`、`## 候補診断`、候補一覧の見出し
+- `candidate_id`、`selected_for_top3`、`rejection_reason`、`source_verified`、`within_24h`などの診断field
+- `coverage=PARTIAL`、`coverage=FULL`、`coverage=UNKNOWN`などcoverage診断
+- 候補ごとのID・記事名・日時・24時間判定・採否・却下理由を並べる候補診断表
+- 検索した媒体、候補の確認状況、候補範囲や検索網羅性を説明する診断文
+
+例として、次のような見出し・field・表を`brief_markdown`に含めてはいけません。本文に混入した場合、JSON契約違反になります。
+
+```text
+## Candidate Diagnostics
+## 候補診断
+候補一覧
+candidate_id
+coverage=PARTIAL
+selected_for_top3
+rejection_reason
+| ID | 記事 | 公開日時 | 24時間以内 | 採否・理由 |
+```
+
 NO_PUBLISH時の例：
 
 ```json

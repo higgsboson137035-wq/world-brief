@@ -204,6 +204,11 @@ def start_run(
         "candidate_diagnostics_status": "UNKNOWN",
         "candidate_diagnostics_coverage": "UNKNOWN",
         "candidate_diagnostics": [],
+        "json_contract_result": "NOT_RUN",
+        "json_contract_reason": "NOT_RUN",
+        "contract_repair_attempted": False,
+        "contract_repair_result": "NOT_ATTEMPTED",
+        "contract_repair_reason": "NOT_ATTEMPTED",
         "search_stage": None,
         "search_strategy": None,
         "query_family": None,
@@ -226,6 +231,11 @@ def record_attempt(
     gate_output: Path, search_stage: str, strategy: str, query_family: str,
     original_output: Path | None = None, repaired_output: Path | None = None,
     repair_metadata: dict | None = None, run_id: str = "run-01",
+    contract_metadata: dict | None = None,
+    original_json_output: Path | None = None,
+    contract_repaired_json: Path | None = None,
+    contract_original_brief: Path | None = None,
+    contract_repaired_brief: Path | None = None,
 ) -> None:
     value = load_record(run_date, run_id)
     directory = run_dir(run_date, run_id)
@@ -235,8 +245,21 @@ def record_attempt(
     gate_target = directory / f"attempt-{number}-gate.json"
     original_target = directory / f"attempt-{number}-original-output.md"
     repaired_target = directory / f"attempt-{number}-repaired-output.md"
+    original_json_target = directory / f"attempt-{number}-original-json-output.json"
+    contract_json_target = directory / f"attempt-{number}-contract-repaired-json.json"
+    contract_original_brief_target = directory / f"attempt-{number}-original-brief-markdown.md"
+    contract_repaired_brief_target = directory / f"attempt-{number}-contract-repaired-brief-markdown.md"
+    format_repaired_brief_target = directory / f"attempt-{number}-format-repaired-brief-markdown.md"
     atomic_copy(raw_output, raw_target)
     atomic_copy(gate_output, final_target)
+    if original_json_output is not None and original_json_output.exists():
+        atomic_copy(original_json_output, original_json_target)
+    if contract_repaired_json is not None and contract_repaired_json.exists():
+        atomic_copy(contract_repaired_json, contract_json_target)
+    if contract_original_brief is not None and contract_original_brief.exists():
+        atomic_copy(contract_original_brief, contract_original_brief_target)
+    if contract_repaired_brief is not None and contract_repaired_brief.exists():
+        atomic_copy(contract_repaired_brief, contract_repaired_brief_target)
     if original_output is not None and original_output.exists():
         atomic_copy(original_output, original_target)
     try:
@@ -259,8 +282,31 @@ def record_attempt(
         repair.update(repair_metadata)
     if repair["format_repair_attempted"] and repaired_output is not None and repaired_output.exists():
         atomic_copy(repaired_output, repaired_target)
+        atomic_copy(repaired_output, format_repaired_brief_target)
     repair["original_output"] = original_target.name if original_output is not None and original_output.exists() else None
     repair["repaired_output"] = repaired_target.name if repaired_target.exists() else None
+    contract = {
+        "json_contract_result": "NOT_RUN",
+        "json_contract_reason": "NOT_RUN",
+        "contract_repair_attempted": False,
+        "contract_repair_result": "NOT_ATTEMPTED",
+        "contract_repair_reason": "NOT_ATTEMPTED",
+    }
+    if contract_metadata:
+        contract.update(contract_metadata)
+    contract.update({
+        "original_json_output": original_json_target.name if original_json_target.exists() else None,
+        "contract_repaired_json": contract_json_target.name if contract_json_target.exists() else None,
+        "contract_original_brief_markdown": (
+            contract_original_brief_target.name if contract_original_brief_target.exists() else None
+        ),
+        "contract_repaired_brief_markdown": (
+            contract_repaired_brief_target.name if contract_repaired_brief_target.exists() else None
+        ),
+        "format_repaired_brief_markdown": (
+            format_repaired_brief_target.name if format_repaired_brief_target.exists() else None
+        ),
+    })
     gate = {
         "attempt": number,
         "search_stage": search_stage,
@@ -273,6 +319,7 @@ def record_attempt(
         "gate_reason": gate_reason,
         "sentinel_seen": sentinel_seen,
         "candidate_diagnostics_status": candidate_status,
+        **contract,
         **repair,
     }
     atomic_json(gate_target, gate)
@@ -304,6 +351,13 @@ def record_attempt(
     value["search_strategy"] = strategy
     value["query_family"] = query_family
     value["candidate_count"] = gate["candidate_count"]
+    for key in (
+        "json_contract_result", "json_contract_reason", "contract_repair_attempted",
+        "contract_repair_result", "contract_repair_reason", "original_json_output",
+        "contract_repaired_json", "contract_original_brief_markdown",
+        "contract_repaired_brief_markdown", "format_repaired_brief_markdown",
+    ):
+        value[key] = contract[key]
     atomic_json(record_path(run_date, run_id), value)
 
 
@@ -472,6 +526,15 @@ def main() -> int:
     attempt.add_argument("--format-repair-result", default="NOT_ATTEMPTED")
     attempt.add_argument("--repaired-gate-result", default="NOT_RUN")
     attempt.add_argument("--repaired-gate-reason", default="NOT_RUN")
+    attempt.add_argument("--json-contract-result", default="NOT_RUN")
+    attempt.add_argument("--json-contract-reason", default="NOT_RUN")
+    attempt.add_argument("--contract-repair-attempted", choices=("true", "false"), default="false")
+    attempt.add_argument("--contract-repair-result", default="NOT_ATTEMPTED")
+    attempt.add_argument("--contract-repair-reason", default="NOT_ATTEMPTED")
+    attempt.add_argument("--original-json-output", type=Path)
+    attempt.add_argument("--contract-repaired-json", type=Path)
+    attempt.add_argument("--contract-original-brief", type=Path)
+    attempt.add_argument("--contract-repaired-brief", type=Path)
     extract = sub.add_parser("extract")
     extract.add_argument("raw_output", type=Path)
     extract.add_argument("brief_output", type=Path)
@@ -516,12 +579,21 @@ def main() -> int:
                 "repaired_gate_result": args.repaired_gate_result,
                 "repaired_gate_reason": args.repaired_gate_reason,
             }
+            contract_metadata = {
+                "json_contract_result": args.json_contract_result,
+                "json_contract_reason": args.json_contract_reason,
+                "contract_repair_attempted": args.contract_repair_attempted == "true",
+                "contract_repair_result": args.contract_repair_result,
+                "contract_repair_reason": args.contract_repair_reason,
+            }
             record_attempt(args.date, args.number, args.codex_exit_code, args.gate_result,
                            args.gate_reason, args.sentinel_seen == "true", args.candidate_status,
                            args.raw_output, args.candidate_output, args.gate_output,
                            args.search_stage, args.strategy, args.query_family,
                            args.original_output, args.repaired_output, repair_metadata,
-                           args.run_id)
+                           args.run_id, contract_metadata, args.original_json_output,
+                           args.contract_repaired_json, args.contract_original_brief,
+                           args.contract_repaired_brief)
         elif args.command == "extract":
             status, diag = extract_response(args.raw_output, args.brief_output, args.candidate_output)
             print(f"{status} {diag}")

@@ -14,6 +14,7 @@ PROMPT = ROOT / "prompts" / "daily_review_draft.md"
 GATE = ROOT / "scripts" / "review_draft_gate.py"
 DIAGNOSTICS = ROOT / "scripts" / "run_diagnostics.py"
 REPAIR = ROOT / "scripts" / "format_repair.py"
+JSON_CONTRACT = ROOT / "scripts" / "json_contract.py"
 
 
 def make_brief(duplicate=False, missing_top3=False, japan_heading_only=False, japan_short=False, japan_shallow=False, extra_heading=False):
@@ -92,6 +93,34 @@ def make_brief(duplicate=False, missing_top3=False, japan_heading_only=False, ja
     ])
 
 
+def make_candidate_diagnostics():
+    sources = [
+        ("Reuters", "https://www.reuters.com/world/a"),
+        ("AP", "https://apnews.com/article/b"),
+        ("BBC", "https://www.bbc.com/news/articles/c"),
+    ]
+    return {
+        "coverage": "COMPLETE",
+        "candidates": [
+            {
+                "candidate_id": f"C{index}", "title": f"Article {index}",
+                "source": source, "url": url, "published_at": "UNKNOWN",
+                "within_24h": True, "source_verified": True, "duplicate": False,
+                "selected_for_top3": True, "rejection_reason": None,
+            }
+            for index, (source, url) in enumerate(sources, start=1)
+        ],
+    }
+
+
+def response_json(body, final_status="PUBLISH", diagnostics=None):
+    return json.dumps({
+        "final_status": final_status,
+        "brief_markdown": body,
+        "candidate_diagnostics": diagnostics or make_candidate_diagnostics(),
+    }, ensure_ascii=False)
+
+
 class GenerateReviewDraftTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="world-brief-review-test-")
@@ -104,6 +133,7 @@ class GenerateReviewDraftTests(unittest.TestCase):
         shutil.copy2(GATE, self.root / "scripts" / GATE.name)
         shutil.copy2(DIAGNOSTICS, self.root / "scripts" / DIAGNOSTICS.name)
         shutil.copy2(REPAIR, self.root / "scripts" / REPAIR.name)
+        shutil.copy2(JSON_CONTRACT, self.root / "scripts" / JSON_CONTRACT.name)
         shutil.copy2(PROMPT, self.root / "prompts" / PROMPT.name)
         self.fake_bin = self.root / "fake-bin"
         self.fake_bin.mkdir()
@@ -152,19 +182,24 @@ class GenerateReviewDraftTests(unittest.TestCase):
             japan_shallow=(mode == "japan_shallow"),
             extra_heading=(mode == "extra_heading"),
         )
+        publish_response = response_json(payload)
+        no_publish_response = response_json(
+            "INSUFFICIENT_VERIFIED_ARTICLES", "NO_PUBLISH",
+            {"coverage": "PARTIAL", "candidates": []},
+        )
         return (
             "#!/bin/sh\n"
             "PROMPT=$(cat)\n"
             "printf '%s\\n' \"$PROMPT\" | sed -n 's/^SEARCH_STAGE=//p' >> \"$WORLD_BRIEF_TEST_CALLS\"\n"
             f"MODE={mode!r}\n"
             "if [ \"$MODE\" = nonzero ]; then exit 7; fi\n"
-            "if [ \"$MODE\" = insufficient ]; then printf 'INSUFFICIENT_VERIFIED_ARTICLES'; exit 0; fi\n"
+            f"if [ \"$MODE\" = insufficient ]; then printf '%s' {self._shell_quote(no_publish_response)}; exit 0; fi\n"
             "if [ \"$MODE\" = insufficient_extra ]; then printf 'INSUFFICIENT_VERIFIED_ARTICLES\\nextra'; exit 0; fi\n"
             "if [ \"$MODE\" = insufficient_typo ]; then printf 'INSUFFICIENT_VERIFIED_ARTICLE'; exit 0; fi\n"
             "if [ \"$MODE\" = invalid_date ]; then "
-            f"printf '%s' {self._shell_quote(payload.replace('_Date: 2026-10-04_', '_Date: 2026-10-03_', 1))}; exit 0; fi\n"
+            f"printf '%s' {self._shell_quote(response_json(payload.replace('_Date: 2026-10-04_', '_Date: 2026-10-03_', 1)))}; exit 0; fi\n"
             "if [ \"$MODE\" != empty ] && [ \"$MODE\" != nonzero ]; then\n"
-            f"  printf '%s' {self._shell_quote(payload)}\n"
+            f"  printf '%s' {self._shell_quote(publish_response)}\n"
             "fi\n"
             "exit 0\n"
         )
@@ -174,13 +209,26 @@ class GenerateReviewDraftTests(unittest.TestCase):
 
     def _sequence_codex(self, sentinel_attempts):
         payload = make_brief()
+        publish_response = response_json(payload)
+        sentinel_response = response_json(
+            "INSUFFICIENT_VERIFIED_ARTICLES", "NO_PUBLISH",
+            {"coverage": "PARTIAL", "candidates": []},
+        )
         self._write_executable(
             self.codex,
             "#!/bin/sh\n"
             "PROMPT=$(cat)\n"
             "printf '%s\\n' \"$PROMPT\" | sed -n 's/^SEARCH_STAGE=//p' >> \"$WORLD_BRIEF_TEST_CALLS\"\n"
             "count=$(wc -l < \"$WORLD_BRIEF_TEST_CALLS\")\n"
-            f"if [ \"$count\" -le {sentinel_attempts} ]; then printf 'INSUFFICIENT_VERIFIED_ARTICLES'; else printf '%s' {self._shell_quote(payload)}; fi\n",
+            f"if [ \"$count\" -le {sentinel_attempts} ]; then printf '%s' {self._shell_quote(sentinel_response)}; else printf '%s' {self._shell_quote(publish_response)}; fi\n",
+        )
+
+    def _set_response(self, response):
+        self._write_executable(
+            self.codex,
+            "#!/bin/sh\nPROMPT=$(cat)\n"
+            "printf '%s\\n' \"$PROMPT\" | sed -n 's/^SEARCH_STAGE=//p' >> \"$WORLD_BRIEF_TEST_CALLS\"\n"
+            f"printf '%s' {self._shell_quote(response)}\n",
         )
 
     def _snapshot_public(self):
@@ -246,6 +294,7 @@ class GenerateReviewDraftTests(unittest.TestCase):
         self.assertEqual(self.calls.read_text(encoding="utf-8").splitlines(), ["GENERAL"])
         record = json.loads((run_dir / "diagnostic.json").read_text(encoding="utf-8"))
         self.assertFalse(record["format_repair_attempted"])
+        self.assertFalse(record["contract_repair_attempted"])
         self.assertEqual(record["original_gate_result"], "PASS")
         self._assert_public_unchanged(before)
 
@@ -353,7 +402,7 @@ class GenerateReviewDraftTests(unittest.TestCase):
         before = self._snapshot_public()
         result = self._run("empty")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("empty_output", result.stderr)
+        self.assertIn("FAILED_JSON_CONTRACT", result.stderr)
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
         self._assert_public_unchanged(before)
 
@@ -366,13 +415,13 @@ class GenerateReviewDraftTests(unittest.TestCase):
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.html").exists())
         run_dir = self.root / "logs/runs/2026-10-04"
-        self.assertEqual((run_dir / "attempt-1-codex-output.md").read_text(encoding="utf-8"), "INSUFFICIENT_VERIFIED_ARTICLES")
+        self.assertEqual(json.loads((run_dir / "attempt-1-codex-output.md").read_text(encoding="utf-8"))["final_status"], "NO_PUBLISH")
         self.assertEqual((run_dir / "final-output.md").read_text(encoding="utf-8"), "INSUFFICIENT_VERIFIED_ARTICLES")
-        self.assertIn('"status": "UNKNOWN"', (run_dir / "candidate-diagnostics.json").read_text(encoding="utf-8"))
+        self.assertIn('"status": "RECORDED"', (run_dir / "candidate-diagnostics.json").read_text(encoding="utf-8"))
         record = json.loads((run_dir / "diagnostic.json").read_text(encoding="utf-8"))
         self.assertEqual([item["strategy"] for item in record["attempts"]], ["GENERAL", "TRUSTED_SOURCES", "CATEGORY_EXPANSION"])
         self.assertTrue(all(item["gate_result"] == "RETRY" and item["sentinel_seen"] for item in record["attempts"]))
-        self.assertEqual([item["candidate_count"] for item in record["attempts"]], [None, None, None])
+        self.assertEqual([item["candidate_count"] for item in record["attempts"]], [0, 0, 0])
         self._assert_public_unchanged(before)
 
     def test_general_sentinel_then_trusted_source_success_stops_after_two_stages(self):
@@ -421,6 +470,87 @@ class GenerateReviewDraftTests(unittest.TestCase):
         self.assertIn('"candidate_diagnostics"', (run_dir / "attempt-1-codex-output.md").read_text(encoding="utf-8"))
         self.assertEqual((run_dir / "final-output.md").read_text(encoding="utf-8"), "INSUFFICIENT_VERIFIED_ARTICLES")
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
+
+    def test_contract_repair_removes_embedded_diagnostics_before_quality_gate(self):
+        body = make_brief() + (
+            "\n## Candidate Diagnostics\n\n"
+            "This stage reviewed candidates; coverage=PARTIAL.\n\n"
+            "| ID | Article | Published At | Within 24h | Selection |\n"
+            "|---|---|---|---|---|\n"
+            "| C1 | Article 1 | UNKNOWN | true | selected_for_top3 |\n\n"
+            "## Coverage Note\n\nSearch coverage was partial.\n"
+        )
+        expected_candidates = make_candidate_diagnostics()["candidates"]
+        self._set_response(response_json(body))
+        result = self._run("custom")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run_dir = self.root / "logs/runs/2026-10-04"
+        record = json.loads((run_dir / "diagnostic.json").read_text(encoding="utf-8"))
+        self.assertTrue(record["contract_repair_attempted"])
+        self.assertEqual(record["contract_repair_result"], "PASS")
+        self.assertEqual(record["json_contract_result"], "PASS")
+        self.assertEqual(record["original_gate_result"], "PASS")
+        self.assertTrue((run_dir / "attempt-1-original-json-output.json").is_file())
+        self.assertTrue((run_dir / "attempt-1-contract-repaired-json.json").is_file())
+        original = (run_dir / "attempt-1-original-brief-markdown.md").read_text(encoding="utf-8")
+        repaired = (run_dir / "attempt-1-contract-repaired-brief-markdown.md").read_text(encoding="utf-8")
+        self.assertIn("Candidate Diagnostics", original)
+        self.assertNotIn("Candidate Diagnostics", repaired)
+        saved = json.loads((run_dir / "attempt-1-candidates.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["candidates"], expected_candidates)
+        final_brief = (self.root / "drafts/2026-10-04-human-review.md").read_text(encoding="utf-8")
+        self.assertNotIn("candidate_id", final_brief)
+        self.assertNotIn("coverage=PARTIAL", final_brief)
+        self.assertEqual(self.calls.read_text(encoding="utf-8").splitlines(), ["GENERAL"])
+
+    def test_contract_repair_then_format_repair_run_in_order(self):
+        body = make_brief(extra_heading=True) + (
+            "\n## Candidate Diagnostics\n\n| candidate_id | title | selected_for_top3 |\n"
+            "|---|---|---|\n| C1 | Article 1 | true |\n"
+        )
+        self._set_response(response_json(body))
+        result = self._run("custom")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run_dir = self.root / "logs/runs/2026-10-04"
+        record = json.loads((run_dir / "diagnostic.json").read_text(encoding="utf-8"))
+        gate = json.loads((run_dir / "attempt-1-gate.json").read_text(encoding="utf-8"))
+        self.assertTrue(record["contract_repair_attempted"])
+        self.assertTrue(record["format_repair_attempted"])
+        self.assertEqual(record["contract_repair_result"], "PASS")
+        self.assertEqual(record["original_gate_reason"], "required_heading_order_invalid")
+        self.assertEqual(record["repaired_gate_result"], "PASS")
+        self.assertTrue((run_dir / gate["contract_repaired_brief_markdown"]).is_file())
+        self.assertTrue((run_dir / gate["format_repaired_brief_markdown"]).is_file())
+        self.assertEqual(self.calls.read_text(encoding="utf-8").splitlines(), ["GENERAL"])
+
+    def test_failed_contract_repair_stops_before_quality_gate(self):
+        body = make_brief() + "\n## Candidate Diagnostics\n\n| candidate_id | title |\n|---|---|\n| C1 | Article 1 |\n"
+        self._set_response(response_json(body))
+        contract_path = self.root / "scripts/json_contract.py"
+        contract_real = self.root / "scripts/json_contract_real.py"
+        contract_path.rename(contract_real)
+        self._write_executable(
+            contract_path,
+            "#!/usr/bin/env python3\nimport pathlib, runpy, shutil, sys\n"
+            f"real = pathlib.Path({str(contract_real)!r})\n"
+            "if sys.argv[1] == 'repair':\n"
+            "    shutil.copyfile(sys.argv[2], sys.argv[3])\n"
+            "    print('PASS none')\n"
+            "else:\n"
+            "    sys.path.insert(0, str(real.parent))\n"
+            "    runpy.run_path(str(real), run_name='__main__')\n",
+        )
+        result = self._run("custom")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("FAILED_JSON_CONTRACT", result.stderr)
+        self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
+        run_dir = self.root / "logs/runs/2026-10-04"
+        gate = json.loads((run_dir / "attempt-1-gate.json").read_text(encoding="utf-8"))
+        self.assertEqual(gate["json_contract_result"], "FAIL")
+        self.assertEqual(gate["contract_repair_result"], "FAIL")
+        self.assertEqual(gate["gate_reason"], "FAILED_JSON_CONTRACT")
+        self.assertEqual(gate["original_gate_result"], "NOT_RUN")
+        self.assertFalse(gate["format_repair_attempted"])
 
     def test_gate_failure_stops_after_one_strategy_and_logs_reason(self):
         result = self._run("invalid_date")
@@ -479,14 +609,14 @@ class GenerateReviewDraftTests(unittest.TestCase):
     def test_sentinel_with_extra_text_fails_closed_as_invalid_output(self):
         result = self._run("insufficient_extra")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("invalid_output", result.stderr)
+        self.assertIn("FAILED_JSON_CONTRACT", result.stderr)
         self.assertEqual(len(self.calls.read_text(encoding="utf-8").splitlines()), 1)
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
 
     def test_typo_sentinel_fails_closed_as_invalid_output(self):
         result = self._run("insufficient_typo")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("invalid_output", result.stderr)
+        self.assertIn("FAILED_JSON_CONTRACT", result.stderr)
         self.assertEqual(len(self.calls.read_text(encoding="utf-8").splitlines()), 1)
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
 
@@ -523,6 +653,9 @@ class GenerateReviewDraftTests(unittest.TestCase):
         self.assertIn("少なくとも3件", prompt)
         self.assertIn("現在のsearch stageで公開可能なBriefを構成できなかった", prompt)
         self.assertIn("candidate_diagnostics", prompt)
+        self.assertIn("本文へコピー・要約・表として再掲しません", prompt)
+        self.assertIn("selected_for_top3", prompt)
+        self.assertIn("候補診断表", prompt)
         self.assertIn("within_24h", prompt)
         self.assertIn('"final_status": "PUBLISH"', prompt)
         self.assertIn("brief_markdown`を`INSUFFICIENT_VERIFIED_ARTICLES`", prompt)

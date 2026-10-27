@@ -58,10 +58,15 @@ GATE_OUTPUT="$WORK_DIR/brief-output.md"
 CANDIDATE_OUTPUT="$WORK_DIR/candidates.json"
 ORIGINAL_OUTPUT="$WORK_DIR/original-brief.md"
 REPAIRED_OUTPUT="$WORK_DIR/repaired-brief.md"
+ORIGINAL_JSON_OUTPUT="$WORK_DIR/original-json-output.json"
+CONTRACT_REPAIRED_JSON="$WORK_DIR/contract-repaired-output.json"
+CONTRACT_ORIGINAL_BRIEF="$WORK_DIR/original-brief-markdown.md"
+CONTRACT_REPAIRED_BRIEF="$WORK_DIR/contract-repaired-brief-markdown.md"
 STAGED_MD="$WORK_DIR/review-draft.md"
 STAGED_HTML="$WORK_DIR/review-draft.html"
 DIAGNOSTICS="$ROOT/scripts/run_diagnostics.py"
 FORMAT_REPAIR="$ROOT/scripts/format_repair.py"
+JSON_CONTRACT="$ROOT/scripts/json_contract.py"
 RUN_DIAGNOSTIC_DIR="$ROOT/logs/runs/$TODAY"
 if [[ "$RUN_ID" == "run-02" ]]; then RUN_DIAGNOSTIC_DIR="$RUN_DIAGNOSTIC_DIR/run-02"; fi
 
@@ -133,6 +138,12 @@ for STAGE in GENERAL TRUSTED_SOURCES CATEGORY_EXPANSION; do
     RESPONSE_STATUS="UNKNOWN"
     CANDIDATE_STATUS="UNKNOWN"
     SENTINEL_SEEN="false"
+    JSON_CONTRACT_RESULT="NOT_RUN"
+    JSON_CONTRACT_REASON="NOT_RUN"
+    CONTRACT_REPAIR_ATTEMPTED=false
+    CONTRACT_REPAIR_RESULT=NOT_ATTEMPTED
+    CONTRACT_REPAIR_REASON=NOT_ATTEMPTED
+    QUALITY_GATE_RAN=false
     if run_codex "$RENDERED_PROMPT"; then
         CODEX_EXIT=0
     else
@@ -145,24 +156,81 @@ for STAGE in GENERAL TRUSTED_SOURCES CATEGORY_EXPANSION; do
         printf '{"status":"UNKNOWN","coverage":"UNKNOWN","candidates":[]}\n' > "$CANDIDATE_OUTPUT"
         GATE_RESULT="FAIL"
     else
-        if EXTRACT_INFO="$("$PYTHON_BIN" -B "$DIAGNOSTICS" extract "$RAW_OUTPUT" "$GATE_OUTPUT" "$CANDIDATE_OUTPUT" 2>&1)"; then
-            read -r RESPONSE_STATUS CANDIDATE_STATUS <<< "$EXTRACT_INFO"
-            FAILURE_REASON="$(validate_brief "$GATE_OUTPUT")"
+        cp "$RAW_OUTPUT" "$ORIGINAL_JSON_OUTPUT" || fail "original_json_save_failed"
+        CONTRACT_INFO="$("$PYTHON_BIN" -B "$JSON_CONTRACT" validate "$RAW_OUTPUT" \
+            "$CONTRACT_ORIGINAL_BRIEF" "$CANDIDATE_OUTPUT" 2>&1)"
+        read -r JSON_CONTRACT_RESULT JSON_CONTRACT_REASON <<< "$CONTRACT_INFO"
+        if [[ "$JSON_CONTRACT_RESULT" == "CONTRACT_REPAIRABLE" ]]; then
+            CONTRACT_REPAIR_ATTEMPTED=true
+            CONTRACT_REPAIR_RESULT=FAIL
+            CONTRACT_REPAIR_REASON="$JSON_CONTRACT_REASON"
+            if REPAIR_INFO="$("$PYTHON_BIN" -B "$JSON_CONTRACT" repair "$RAW_OUTPUT" \
+                "$CONTRACT_REPAIRED_JSON" 2>&1)"; then
+                read -r CONTRACT_REPAIR_RESULT REPAIR_REASON <<< "$REPAIR_INFO"
+            else
+                REPAIR_REASON="$REPAIR_INFO"
+            fi
+            if [[ "$CONTRACT_REPAIR_RESULT" == "PASS" ]]; then
+                REVALIDATE_INFO="$("$PYTHON_BIN" -B "$JSON_CONTRACT" validate \
+                    "$CONTRACT_REPAIRED_JSON" "$CONTRACT_REPAIRED_BRIEF" "$CANDIDATE_OUTPUT" 2>&1)"
+                read -r REVALIDATE_RESULT REVALIDATE_REASON <<< "$REVALIDATE_INFO"
+                if [[ "$REVALIDATE_RESULT" == "PUBLISH" ]]; then
+                    JSON_CONTRACT_RESULT="PASS"
+                    JSON_CONTRACT_REASON="${CONTRACT_REPAIR_REASON}_repaired"
+                    CONTRACT_REPAIR_REASON="$CONTRACT_REPAIR_REASON"
+                    cp "$CONTRACT_REPAIRED_BRIEF" "$GATE_OUTPUT" || fail "contract_repaired_brief_copy_failed"
+                    RESPONSE_STATUS="PUBLISH"
+                    CANDIDATE_STATUS="RECORDED"
+                else
+                    JSON_CONTRACT_RESULT="FAIL"
+                    JSON_CONTRACT_REASON="${REVALIDATE_REASON:-contract_repair_validation_failed}"
+                    CONTRACT_REPAIR_RESULT="FAIL"
+                    CONTRACT_REPAIR_REASON="$JSON_CONTRACT_REASON"
+                    FAILURE_REASON="FAILED_JSON_CONTRACT"
+                    GATE_RESULT="FAIL"
+                    : > "$GATE_OUTPUT"
+                fi
+            else
+                JSON_CONTRACT_RESULT="FAIL"
+                JSON_CONTRACT_REASON="$CONTRACT_REPAIR_REASON"
+                CONTRACT_REPAIR_REASON="${REPAIR_REASON:-contract_repair_failed}"
+                FAILURE_REASON="FAILED_JSON_CONTRACT"
+                GATE_RESULT="FAIL"
+                : > "$GATE_OUTPUT"
+            fi
+        elif [[ "$JSON_CONTRACT_RESULT" == "PUBLISH" || "$JSON_CONTRACT_RESULT" == "NO_PUBLISH" ]]; then
+            RESPONSE_STATUS="$JSON_CONTRACT_RESULT"
+            JSON_CONTRACT_RESULT="PASS"
+            if [[ "$JSON_CONTRACT_REASON" == "none" ]]; then JSON_CONTRACT_REASON="none"; fi
+            cp "$CONTRACT_ORIGINAL_BRIEF" "$GATE_OUTPUT" || fail "brief_extract_failed"
+            CANDIDATE_STATUS="RECORDED"
         else
-            FAILURE_REASON="diagnostic_output_invalid"
+            JSON_CONTRACT_RESULT="FAIL"
+            JSON_CONTRACT_REASON="${JSON_CONTRACT_REASON:-json_contract_invalid}"
+            FAILURE_REASON="FAILED_JSON_CONTRACT"
+            GATE_RESULT="FAIL"
             : > "$GATE_OUTPUT"
             printf '{"status":"UNKNOWN","coverage":"UNKNOWN","candidates":[]}\n' > "$CANDIDATE_OUTPUT"
         fi
-        if [[ "$FAILURE_REASON" == "pass" ]]; then
-            GATE_RESULT="PASS"
-        elif [[ "$FAILURE_REASON" == "no_publish_insufficient_verified_articles" ]]; then
-            GATE_RESULT="RETRY"
-        else
-            GATE_RESULT="FAIL"
+        if [[ "$JSON_CONTRACT_RESULT" == "PASS" ]]; then
+            if [[ "$RESPONSE_STATUS" == "NO_PUBLISH" ]]; then
+                FAILURE_REASON="no_publish_insufficient_verified_articles"
+                GATE_RESULT="RETRY"
+            else
+                FAILURE_REASON="$(validate_brief "$GATE_OUTPUT")"
+                QUALITY_GATE_RAN=true
+                if [[ "$FAILURE_REASON" == "pass" ]]; then
+                    GATE_RESULT="PASS"
+                elif [[ "$FAILURE_REASON" == "no_publish_insufficient_verified_articles" ]]; then
+                    GATE_RESULT="RETRY"
+                else
+                    GATE_RESULT="FAIL"
+                fi
+            fi
         fi
     fi
 
-    ORIGINAL_GATE_RESULT="$GATE_RESULT"
+    if [[ "$QUALITY_GATE_RAN" == true ]]; then ORIGINAL_GATE_RESULT="$GATE_RESULT"; else ORIGINAL_GATE_RESULT="NOT_RUN"; fi
     ORIGINAL_GATE_REASON="$FAILURE_REASON"
     FORMAT_REPAIR_ATTEMPTED=false
     FORMAT_REPAIR_RESULT=NOT_ATTEMPTED
@@ -170,7 +238,7 @@ for STAGE in GENERAL TRUSTED_SOURCES CATEGORY_EXPANSION; do
     REPAIRED_GATE_REASON=NOT_RUN
     if [[ -f "$GATE_OUTPUT" ]]; then cp "$GATE_OUTPUT" "$ORIGINAL_OUTPUT"; else : > "$ORIGINAL_OUTPUT"; fi
 
-    if [[ "$CODEX_EXIT" -eq 0 ]] && [[ "$GATE_RESULT" == "FAIL" ]] && \
+    if [[ "$CODEX_EXIT" -eq 0 ]] && [[ "$QUALITY_GATE_RAN" == true ]] && [[ "$GATE_RESULT" == "FAIL" ]] && \
         [[ "$("$PYTHON_BIN" -B "$FORMAT_REPAIR" classify "$FAILURE_REASON" "$GATE_OUTPUT")" == "FORMAT_REPAIRABLE" ]]; then
         FORMAT_REPAIR_ATTEMPTED=true
         if "$PYTHON_BIN" -B "$FORMAT_REPAIR" repair "$ORIGINAL_OUTPUT" "$REPAIRED_OUTPUT"; then
@@ -208,6 +276,15 @@ for STAGE in GENERAL TRUSTED_SOURCES CATEGORY_EXPANSION; do
         --repaired-gate-result "$REPAIRED_GATE_RESULT" \
         --repaired-gate-reason "$REPAIRED_GATE_REASON" \
         --repaired-output "$REPAIRED_OUTPUT" \
+        --json-contract-result "$JSON_CONTRACT_RESULT" \
+        --json-contract-reason "$JSON_CONTRACT_REASON" \
+        --contract-repair-attempted "$CONTRACT_REPAIR_ATTEMPTED" \
+        --contract-repair-result "$CONTRACT_REPAIR_RESULT" \
+        --contract-repair-reason "$CONTRACT_REPAIR_REASON" \
+        --original-json-output "$ORIGINAL_JSON_OUTPUT" \
+        --contract-repaired-json "$CONTRACT_REPAIRED_JSON" \
+        --contract-original-brief "$CONTRACT_ORIGINAL_BRIEF" \
+        --contract-repaired-brief "$CONTRACT_REPAIRED_BRIEF" \
         --run-id "$RUN_ID" || fail "diagnostic_attempt_save_failed"
 
     if [[ "$FAILURE_REASON" == "pass" ]]; then
