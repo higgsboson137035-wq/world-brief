@@ -13,9 +13,10 @@ SCRIPT = ROOT / "scripts" / "generate_review_draft.sh"
 PROMPT = ROOT / "prompts" / "daily_review_draft.md"
 GATE = ROOT / "scripts" / "review_draft_gate.py"
 DIAGNOSTICS = ROOT / "scripts" / "run_diagnostics.py"
+REPAIR = ROOT / "scripts" / "format_repair.py"
 
 
-def make_brief(duplicate=False, missing_top3=False, japan_heading_only=False, japan_short=False, japan_shallow=False):
+def make_brief(duplicate=False, missing_top3=False, japan_heading_only=False, japan_short=False, japan_shallow=False, extra_heading=False):
     top3 = ["1. First distinct event.", "2. Second distinct event."]
     if not missing_top3:
         top3.append("3. Third distinct event.")
@@ -86,6 +87,7 @@ def make_brief(duplicate=False, missing_top3=False, japan_heading_only=False, ja
         *japan_impact,
         *article(3),
         *repeated,
+        *( ["", "## 詳細：アジア", "Asian detail retained by repair."] if extra_heading else [] ),
         "",
     ])
 
@@ -101,6 +103,7 @@ class GenerateReviewDraftTests(unittest.TestCase):
         shutil.copy2(SCRIPT, self.root / "scripts" / SCRIPT.name)
         shutil.copy2(GATE, self.root / "scripts" / GATE.name)
         shutil.copy2(DIAGNOSTICS, self.root / "scripts" / DIAGNOSTICS.name)
+        shutil.copy2(REPAIR, self.root / "scripts" / REPAIR.name)
         shutil.copy2(PROMPT, self.root / "prompts" / PROMPT.name)
         self.fake_bin = self.root / "fake-bin"
         self.fake_bin.mkdir()
@@ -147,6 +150,7 @@ class GenerateReviewDraftTests(unittest.TestCase):
             japan_heading_only=(mode == "japan_empty"),
             japan_short=(mode == "japan_short"),
             japan_shallow=(mode == "japan_shallow"),
+            extra_heading=(mode == "extra_heading"),
         )
         return (
             "#!/bin/sh\n"
@@ -240,6 +244,9 @@ class GenerateReviewDraftTests(unittest.TestCase):
         self.assertTrue((run_dir / "attempt-1-gate.json").is_file())
         self.assertTrue((run_dir / "attempt-1-candidates.json").is_file())
         self.assertEqual(self.calls.read_text(encoding="utf-8").splitlines(), ["GENERAL"])
+        record = json.loads((run_dir / "diagnostic.json").read_text(encoding="utf-8"))
+        self.assertFalse(record["format_repair_attempted"])
+        self.assertEqual(record["original_gate_result"], "PASS")
         self._assert_public_unchanged(before)
 
     def test_override_writes_only_to_specified_draft_directory(self):
@@ -282,6 +289,9 @@ class GenerateReviewDraftTests(unittest.TestCase):
         result = self._run("top3")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("top3_invalid", result.stderr)
+        record = json.loads((self.root / "logs/runs/2026-10-04/diagnostic.json").read_text(encoding="utf-8"))
+        self.assertFalse(record["format_repair_attempted"])
+        self.assertEqual(record["original_gate_reason"], "top3_invalid")
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
         self.assertEqual(len(self.calls.read_text(encoding="utf-8").splitlines()), 1)
         self._assert_public_unchanged(before)
@@ -308,6 +318,9 @@ class GenerateReviewDraftTests(unittest.TestCase):
         result = self._run("japan_shallow")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("japan_impact_too_shallow", result.stderr)
+        record = json.loads((self.root / "logs/runs/2026-10-04/diagnostic.json").read_text(encoding="utf-8"))
+        self.assertFalse(record["format_repair_attempted"])
+        self.assertEqual(record["original_gate_reason"], "japan_impact_too_shallow")
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
         self._assert_public_unchanged(before)
 
@@ -417,8 +430,51 @@ class GenerateReviewDraftTests(unittest.TestCase):
         gate = json.loads((run_dir / "attempt-1-gate.json").read_text(encoding="utf-8"))
         self.assertEqual(gate["gate_reason"], "date_header_invalid")
         self.assertEqual(gate["search_stage"], "GENERAL")
+        self.assertFalse(gate["format_repair_attempted"])
+        self.assertEqual(gate["original_gate_reason"], "date_header_invalid")
         record = json.loads((run_dir / "diagnostic.json").read_text(encoding="utf-8"))
         self.assertEqual(len(record["attempts"]), 1)
+
+    def test_extra_heading_is_repaired_once_without_search_and_both_outputs_are_saved(self):
+        result = self._run("extra_heading")
+        self._assert_valid_generation_reached_renderer(result)
+        self.assertEqual(self.calls.read_text(encoding="utf-8").splitlines(), ["GENERAL"])
+        run_dir = self.root / "logs/runs/2026-10-04"
+        record = json.loads((run_dir / "diagnostic.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["original_gate_result"], "FAIL")
+        self.assertEqual(record["original_gate_reason"], "required_heading_order_invalid")
+        self.assertTrue(record["format_repair_attempted"])
+        self.assertEqual(record["format_repair_result"], "PASS")
+        self.assertEqual(record["repaired_gate_result"], "PASS")
+        self.assertEqual(record["repaired_gate_reason"], "pass")
+        original = (run_dir / "attempt-1-original-output.md").read_text(encoding="utf-8")
+        repaired = (run_dir / "attempt-1-repaired-output.md").read_text(encoding="utf-8")
+        self.assertIn("## 詳細：アジア", original)
+        self.assertNotIn("## 詳細：アジア", repaired)
+        self.assertIn("Asian detail retained by repair.", repaired)
+        self.assertEqual((run_dir / "attempt-1-final-output.md").read_text(encoding="utf-8"), repaired)
+        self.assertEqual((run_dir / "attempt-1-candidates.json").read_bytes(), (run_dir / "candidate-diagnostics.json").read_bytes())
+
+    def test_repair_that_still_fails_gate_is_limited_to_one_attempt(self):
+        calls = self.root / "repair-calls"
+        fake_repair = (
+            "import sys\nfrom pathlib import Path\n"
+            "if sys.argv[1] == 'classify': print('FORMAT_REPAIRABLE')\n"
+            "elif sys.argv[1] == 'repair':\n"
+            f" p=Path({str(calls)!r}); p.write_text(p.read_text() + 'repair\\n' if p.exists() else 'repair\\n')\n"
+            " Path(sys.argv[3]).write_text(Path(sys.argv[2]).read_text())\n"
+        )
+        (self.root / "scripts" / REPAIR.name).write_text(fake_repair, encoding="utf-8")
+        result = self._run("extra_heading")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("required_heading_order_invalid", result.stderr)
+        self.assertEqual(calls.read_text(encoding="utf-8").splitlines(), ["repair"])
+        record = json.loads((self.root / "logs/runs/2026-10-04/diagnostic.json").read_text(encoding="utf-8"))
+        self.assertTrue(record["format_repair_attempted"])
+        self.assertEqual(record["format_repair_result"], "PASS")
+        self.assertEqual(record["repaired_gate_result"], "FAIL")
+        self.assertEqual(record["repaired_gate_reason"], "required_heading_order_invalid")
+        self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
 
     def test_sentinel_with_extra_text_fails_closed_as_invalid_output(self):
         result = self._run("insufficient_extra")
@@ -478,6 +534,8 @@ class GenerateReviewDraftTests(unittest.TestCase):
         self.assertIn("短期・中期", prompt)
         self.assertIn("不確実性", prompt)
         self.assertIn("水増し", prompt)
+        self.assertIn("列挙した`##`見出しだけ", prompt)
+        self.assertIn("地域別・テーマ別の追加sectionは作らない", prompt)
 
     def test_script_has_no_git_publish_commands_or_public_builder(self):
         source = SCRIPT.read_text(encoding="utf-8")

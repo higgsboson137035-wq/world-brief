@@ -53,9 +53,12 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 RAW_OUTPUT="$WORK_DIR/codex-output.md"
 GATE_OUTPUT="$WORK_DIR/brief-output.md"
 CANDIDATE_OUTPUT="$WORK_DIR/candidates.json"
+ORIGINAL_OUTPUT="$WORK_DIR/original-brief.md"
+REPAIRED_OUTPUT="$WORK_DIR/repaired-brief.md"
 STAGED_MD="$WORK_DIR/review-draft.md"
 STAGED_HTML="$WORK_DIR/review-draft.html"
 DIAGNOSTICS="$ROOT/scripts/run_diagnostics.py"
+FORMAT_REPAIR="$ROOT/scripts/format_repair.py"
 
 if [[ ! -f "$ROOT/logs/runs/$TODAY/diagnostic.json" ]]; then
     "$PYTHON_BIN" -B "$DIAGNOSTICS" start "$TODAY" || fail "diagnostic_run_start_failed"
@@ -153,12 +156,52 @@ for STAGE in GENERAL TRUSTED_SOURCES CATEGORY_EXPANSION; do
         fi
     fi
 
+    ORIGINAL_GATE_RESULT="$GATE_RESULT"
+    ORIGINAL_GATE_REASON="$FAILURE_REASON"
+    FORMAT_REPAIR_ATTEMPTED=false
+    FORMAT_REPAIR_RESULT=NOT_ATTEMPTED
+    REPAIRED_GATE_RESULT=NOT_RUN
+    REPAIRED_GATE_REASON=NOT_RUN
+    if [[ -f "$GATE_OUTPUT" ]]; then cp "$GATE_OUTPUT" "$ORIGINAL_OUTPUT"; else : > "$ORIGINAL_OUTPUT"; fi
+
+    if [[ "$CODEX_EXIT" -eq 0 ]] && [[ "$GATE_RESULT" == "FAIL" ]] && \
+        [[ "$("$PYTHON_BIN" -B "$FORMAT_REPAIR" classify "$FAILURE_REASON" "$GATE_OUTPUT")" == "FORMAT_REPAIRABLE" ]]; then
+        FORMAT_REPAIR_ATTEMPTED=true
+        if "$PYTHON_BIN" -B "$FORMAT_REPAIR" repair "$ORIGINAL_OUTPUT" "$REPAIRED_OUTPUT"; then
+            FORMAT_REPAIR_RESULT=PASS
+            cp "$REPAIRED_OUTPUT" "$GATE_OUTPUT"
+            FAILURE_REASON="$(validate_brief "$GATE_OUTPUT")"
+            REPAIRED_GATE_REASON="$FAILURE_REASON"
+            if [[ "$FAILURE_REASON" == "pass" ]]; then
+                GATE_RESULT=PASS
+                REPAIRED_GATE_RESULT=PASS
+            else
+                GATE_RESULT=FAIL
+                REPAIRED_GATE_RESULT=FAIL
+            fi
+        else
+            FORMAT_REPAIR_RESULT=FAIL
+            FAILURE_REASON="format_repair_failed"
+            GATE_RESULT=FAIL
+            REPAIRED_GATE_RESULT=FAIL
+            REPAIRED_GATE_REASON="$FAILURE_REASON"
+        fi
+    fi
+
     if [[ "$RESPONSE_STATUS" == "NO_PUBLISH" || "$FAILURE_REASON" == "no_publish_insufficient_verified_articles" ]]; then
         SENTINEL_SEEN="true"
     fi
     "$PYTHON_BIN" -B "$DIAGNOSTICS" attempt "$TODAY" "$ATTEMPT" "$CODEX_EXIT" \
         "$GATE_RESULT" "$FAILURE_REASON" "$SENTINEL_SEEN" "$CANDIDATE_STATUS" \
-        "$RAW_OUTPUT" "$CANDIDATE_OUTPUT" "$GATE_OUTPUT" "$STAGE" "$STRATEGY" "$QUERY_FAMILY" || fail "diagnostic_attempt_save_failed"
+        "$RAW_OUTPUT" "$CANDIDATE_OUTPUT" "$GATE_OUTPUT" "$STAGE" "$STRATEGY" "$QUERY_FAMILY" \
+        --original-output "$ORIGINAL_OUTPUT" \
+        --original-gate-result "$ORIGINAL_GATE_RESULT" \
+        --original-gate-reason "$ORIGINAL_GATE_REASON" \
+        --format-repair-attempted "$FORMAT_REPAIR_ATTEMPTED" \
+        --format-repair-result "$FORMAT_REPAIR_RESULT" \
+        --repaired-gate-result "$REPAIRED_GATE_RESULT" \
+        --repaired-gate-reason "$REPAIRED_GATE_REASON" \
+        --repaired-output "$REPAIRED_OUTPUT" || fail "diagnostic_attempt_save_failed"
 
     if [[ "$FAILURE_REASON" == "pass" ]]; then
         BRIEF_VALID=1

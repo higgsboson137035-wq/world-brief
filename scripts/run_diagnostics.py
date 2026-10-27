@@ -135,6 +135,12 @@ def start_run(run_date: str) -> None:
         "sentinel_seen": False,
         "final_gate_result": "UNKNOWN",
         "final_gate_reason": "run_incomplete",
+        "original_gate_result": "UNKNOWN",
+        "original_gate_reason": "run_incomplete",
+        "format_repair_attempted": False,
+        "format_repair_result": "NOT_ATTEMPTED",
+        "repaired_gate_result": "NOT_RUN",
+        "repaired_gate_reason": "NOT_RUN",
         "candidate_diagnostics_status": "UNKNOWN",
         "candidate_diagnostics_coverage": "UNKNOWN",
         "candidate_diagnostics": [],
@@ -158,6 +164,8 @@ def record_attempt(
     gate_reason: str, sentinel_seen: bool, candidate_status: str,
     raw_output: Path, candidate_output: Path,
     gate_output: Path, search_stage: str, strategy: str, query_family: str,
+    original_output: Path | None = None, repaired_output: Path | None = None,
+    repair_metadata: dict | None = None,
 ) -> None:
     value = load_record(run_date)
     directory = run_dir(run_date)
@@ -165,8 +173,12 @@ def record_attempt(
     final_target = directory / f"attempt-{number}-final-output.md"
     candidate_target = directory / f"attempt-{number}-candidates.json"
     gate_target = directory / f"attempt-{number}-gate.json"
+    original_target = directory / f"attempt-{number}-original-output.md"
+    repaired_target = directory / f"attempt-{number}-repaired-output.md"
     atomic_copy(raw_output, raw_target)
     atomic_copy(gate_output, final_target)
+    if original_output is not None and original_output.exists():
+        atomic_copy(original_output, original_target)
     try:
         candidates = json.loads(candidate_output.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
@@ -175,6 +187,20 @@ def record_attempt(
     atomic_json(candidate_target, candidates)
     atomic_json(directory / "candidate-diagnostics.json", candidates)
     atomic_copy(final_target, directory / "final-output.md")
+    repair = {
+        "original_gate_result": gate_result,
+        "original_gate_reason": gate_reason,
+        "format_repair_attempted": False,
+        "format_repair_result": "NOT_ATTEMPTED",
+        "repaired_gate_result": "NOT_RUN",
+        "repaired_gate_reason": "NOT_RUN",
+    }
+    if repair_metadata:
+        repair.update(repair_metadata)
+    if repair["format_repair_attempted"] and repaired_output is not None and repaired_output.exists():
+        atomic_copy(repaired_output, repaired_target)
+    repair["original_output"] = original_target.name if original_output is not None and original_output.exists() else None
+    repair["repaired_output"] = repaired_target.name if repaired_target.exists() else None
     gate = {
         "attempt": number,
         "search_stage": search_stage,
@@ -187,6 +213,7 @@ def record_attempt(
         "gate_reason": gate_reason,
         "sentinel_seen": sentinel_seen,
         "candidate_diagnostics_status": candidate_status,
+        **repair,
     }
     atomic_json(gate_target, gate)
     attempts = [item for item in value.get("attempts", []) if item.get("attempt") != number]
@@ -196,6 +223,7 @@ def record_attempt(
         "final_output": final_target.name,
         "gate_record": gate_target.name,
         "candidate_diagnostics": candidate_target.name,
+        **repair,
     })
     attempts.sort(key=lambda item: item["attempt"])
     value["attempts"] = attempts
@@ -204,6 +232,11 @@ def record_attempt(
     value["sentinel_seen"] = bool(value.get("sentinel_seen")) or sentinel_seen
     value["final_gate_result"] = gate_result
     value["final_gate_reason"] = gate_reason
+    for key in (
+        "original_gate_result", "original_gate_reason", "format_repair_attempted",
+        "format_repair_result", "repaired_gate_result", "repaired_gate_reason",
+    ):
+        value[key] = repair[key]
     value["candidate_diagnostics_status"] = candidate_status
     value["candidate_diagnostics"] = candidates.get("candidates", [])
     value["candidate_diagnostics_coverage"] = candidates.get("coverage", "UNKNOWN")
@@ -361,6 +394,14 @@ def main() -> int:
     attempt.add_argument("search_stage")
     attempt.add_argument("strategy")
     attempt.add_argument("query_family")
+    attempt.add_argument("--original-output", type=Path)
+    attempt.add_argument("--repaired-output", type=Path)
+    attempt.add_argument("--original-gate-result", default="UNKNOWN")
+    attempt.add_argument("--original-gate-reason", default="UNKNOWN")
+    attempt.add_argument("--format-repair-attempted", choices=("true", "false"), default="false")
+    attempt.add_argument("--format-repair-result", default="NOT_ATTEMPTED")
+    attempt.add_argument("--repaired-gate-result", default="NOT_RUN")
+    attempt.add_argument("--repaired-gate-reason", default="NOT_RUN")
     extract = sub.add_parser("extract")
     extract.add_argument("raw_output", type=Path)
     extract.add_argument("brief_output", type=Path)
@@ -389,10 +430,19 @@ def main() -> int:
         if args.command == "start":
             start_run(args.date)
         elif args.command == "attempt":
+            repair_metadata = {
+                "original_gate_result": args.original_gate_result,
+                "original_gate_reason": args.original_gate_reason,
+                "format_repair_attempted": args.format_repair_attempted == "true",
+                "format_repair_result": args.format_repair_result,
+                "repaired_gate_result": args.repaired_gate_result,
+                "repaired_gate_reason": args.repaired_gate_reason,
+            }
             record_attempt(args.date, args.number, args.codex_exit_code, args.gate_result,
                            args.gate_reason, args.sentinel_seen == "true", args.candidate_status,
                            args.raw_output, args.candidate_output, args.gate_output,
-                           args.search_stage, args.strategy, args.query_family)
+                           args.search_stage, args.strategy, args.query_family,
+                           args.original_output, args.repaired_output, repair_metadata)
         elif args.command == "extract":
             status, diag = extract_response(args.raw_output, args.brief_output, args.candidate_output)
             print(f"{status} {diag}")
