@@ -62,11 +62,13 @@ ORIGINAL_JSON_OUTPUT="$WORK_DIR/original-json-output.json"
 CONTRACT_REPAIRED_JSON="$WORK_DIR/contract-repaired-output.json"
 CONTRACT_ORIGINAL_BRIEF="$WORK_DIR/original-brief-markdown.md"
 CONTRACT_REPAIRED_BRIEF="$WORK_DIR/contract-repaired-brief-markdown.md"
+EVIDENCE_OUTPUT="$WORK_DIR/evidence-consistency.json"
 STAGED_MD="$WORK_DIR/review-draft.md"
 STAGED_HTML="$WORK_DIR/review-draft.html"
 DIAGNOSTICS="$ROOT/scripts/run_diagnostics.py"
 FORMAT_REPAIR="$ROOT/scripts/format_repair.py"
 JSON_CONTRACT="$ROOT/scripts/json_contract.py"
+EVIDENCE_GATE="$ROOT/scripts/top3_evidence_gate.py"
 RUN_DIAGNOSTIC_DIR="$ROOT/logs/runs/$TODAY"
 if [[ "$RUN_ID" == "run-02" ]]; then RUN_DIAGNOSTIC_DIR="$RUN_DIAGNOSTIC_DIR/run-02"; fi
 
@@ -143,7 +145,10 @@ for STAGE in GENERAL TRUSTED_SOURCES CATEGORY_EXPANSION; do
     CONTRACT_REPAIR_ATTEMPTED=false
     CONTRACT_REPAIR_RESULT=NOT_ATTEMPTED
     CONTRACT_REPAIR_REASON=NOT_ATTEMPTED
+    EVIDENCE_CONSISTENCY_RESULT=NOT_RUN
+    EVIDENCE_CONSISTENCY_REASON=NOT_RUN
     QUALITY_GATE_RAN=false
+    VALIDATED_JSON="$RAW_OUTPUT"
     if run_codex "$RENDERED_PROMPT"; then
         CODEX_EXIT=0
     else
@@ -178,6 +183,7 @@ for STAGE in GENERAL TRUSTED_SOURCES CATEGORY_EXPANSION; do
                     JSON_CONTRACT_RESULT="PASS"
                     JSON_CONTRACT_REASON="${CONTRACT_REPAIR_REASON}_repaired"
                     CONTRACT_REPAIR_REASON="$CONTRACT_REPAIR_REASON"
+                    VALIDATED_JSON="$CONTRACT_REPAIRED_JSON"
                     cp "$CONTRACT_REPAIRED_BRIEF" "$GATE_OUTPUT" || fail "contract_repaired_brief_copy_failed"
                     RESPONSE_STATUS="PUBLISH"
                     CANDIDATE_STATUS="RECORDED"
@@ -217,14 +223,24 @@ for STAGE in GENERAL TRUSTED_SOURCES CATEGORY_EXPANSION; do
                 FAILURE_REASON="no_publish_insufficient_verified_articles"
                 GATE_RESULT="RETRY"
             else
-                FAILURE_REASON="$(validate_brief "$GATE_OUTPUT")"
-                QUALITY_GATE_RAN=true
-                if [[ "$FAILURE_REASON" == "pass" ]]; then
-                    GATE_RESULT="PASS"
-                elif [[ "$FAILURE_REASON" == "no_publish_insufficient_verified_articles" ]]; then
-                    GATE_RESULT="RETRY"
+                if EVIDENCE_INFO="$("$PYTHON_BIN" -B "$EVIDENCE_GATE" "$VALIDATED_JSON" \
+                    "$GATE_OUTPUT" "$EVIDENCE_OUTPUT" 2>&1)"; then
+                    read -r EVIDENCE_CONSISTENCY_RESULT EVIDENCE_CONSISTENCY_REASON <<< "$EVIDENCE_INFO"
                 else
+                    read -r EVIDENCE_CONSISTENCY_RESULT EVIDENCE_CONSISTENCY_REASON <<< "$EVIDENCE_INFO"
+                    FAILURE_REASON="${EVIDENCE_CONSISTENCY_REASON:-top3_evidence_inconsistent}"
                     GATE_RESULT="FAIL"
+                fi
+                if [[ "$EVIDENCE_CONSISTENCY_RESULT" == "PASS" ]]; then
+                    FAILURE_REASON="$(validate_brief "$GATE_OUTPUT")"
+                    QUALITY_GATE_RAN=true
+                    if [[ "$FAILURE_REASON" == "pass" ]]; then
+                        GATE_RESULT="PASS"
+                    elif [[ "$FAILURE_REASON" == "no_publish_insufficient_verified_articles" ]]; then
+                        GATE_RESULT="RETRY"
+                    else
+                        GATE_RESULT="FAIL"
+                    fi
                 fi
             fi
         fi
@@ -249,6 +265,14 @@ for STAGE in GENERAL TRUSTED_SOURCES CATEGORY_EXPANSION; do
             if [[ "$FAILURE_REASON" == "pass" ]]; then
                 GATE_RESULT=PASS
                 REPAIRED_GATE_RESULT=PASS
+                if ! EVIDENCE_INFO="$("$PYTHON_BIN" -B "$EVIDENCE_GATE" "$VALIDATED_JSON" \
+                    "$REPAIRED_OUTPUT" "$EVIDENCE_OUTPUT" 2>&1)"; then
+                    read -r EVIDENCE_CONSISTENCY_RESULT EVIDENCE_CONSISTENCY_REASON <<< "$EVIDENCE_INFO"
+                    FAILURE_REASON="${EVIDENCE_CONSISTENCY_REASON:-top3_evidence_inconsistent}"
+                    GATE_RESULT=FAIL
+                else
+                    read -r EVIDENCE_CONSISTENCY_RESULT EVIDENCE_CONSISTENCY_REASON <<< "$EVIDENCE_INFO"
+                fi
             else
                 GATE_RESULT=FAIL
                 REPAIRED_GATE_RESULT=FAIL
@@ -285,6 +309,7 @@ for STAGE in GENERAL TRUSTED_SOURCES CATEGORY_EXPANSION; do
         --contract-repaired-json "$CONTRACT_REPAIRED_JSON" \
         --contract-original-brief "$CONTRACT_ORIGINAL_BRIEF" \
         --contract-repaired-brief "$CONTRACT_REPAIRED_BRIEF" \
+        --evidence-consistency-output "$EVIDENCE_OUTPUT" \
         --run-id "$RUN_ID" || fail "diagnostic_attempt_save_failed"
 
     if [[ "$FAILURE_REASON" == "pass" ]]; then

@@ -15,6 +15,7 @@ GATE = ROOT / "scripts" / "review_draft_gate.py"
 DIAGNOSTICS = ROOT / "scripts" / "run_diagnostics.py"
 REPAIR = ROOT / "scripts" / "format_repair.py"
 JSON_CONTRACT = ROOT / "scripts" / "json_contract.py"
+EVIDENCE_GATE = ROOT / "scripts" / "top3_evidence_gate.py"
 
 
 def make_brief(duplicate=False, missing_top3=False, japan_heading_only=False, japan_short=False, japan_shallow=False, extra_heading=False):
@@ -105,6 +106,7 @@ def make_candidate_diagnostics():
             {
                 "candidate_id": f"C{index}", "title": f"Article {index}",
                 "source": source, "url": url, "published_at": "UNKNOWN",
+                "verified_summary": f"{['First', 'Second', 'Third'][index - 1]} distinct event.",
                 "within_24h": True, "source_verified": True, "duplicate": False,
                 "selected_for_top3": True, "rejection_reason": None,
             }
@@ -114,10 +116,23 @@ def make_candidate_diagnostics():
 
 
 def response_json(body, final_status="PUBLISH", diagnostics=None):
+    diagnostics = diagnostics or make_candidate_diagnostics()
+    top3 = [] if final_status == "NO_PUBLISH" else [
+        {
+            "candidate_id": item["candidate_id"],
+            "headline": item["title"],
+            "source_title": item["title"],
+            "source": item["source"],
+            "source_url": item["url"],
+            "summary": item["verified_summary"],
+        }
+        for item in diagnostics["candidates"] if item.get("selected_for_top3") is True
+    ]
     return json.dumps({
         "final_status": final_status,
         "brief_markdown": body,
-        "candidate_diagnostics": diagnostics or make_candidate_diagnostics(),
+        "top3": top3,
+        "candidate_diagnostics": diagnostics,
     }, ensure_ascii=False)
 
 
@@ -134,6 +149,7 @@ class GenerateReviewDraftTests(unittest.TestCase):
         shutil.copy2(DIAGNOSTICS, self.root / "scripts" / DIAGNOSTICS.name)
         shutil.copy2(REPAIR, self.root / "scripts" / REPAIR.name)
         shutil.copy2(JSON_CONTRACT, self.root / "scripts" / JSON_CONTRACT.name)
+        shutil.copy2(EVIDENCE_GATE, self.root / "scripts" / EVIDENCE_GATE.name)
         shutil.copy2(PROMPT, self.root / "prompts" / PROMPT.name)
         self.fake_bin = self.root / "fake-bin"
         self.fake_bin.mkdir()
@@ -337,10 +353,12 @@ class GenerateReviewDraftTests(unittest.TestCase):
         before = self._snapshot_public()
         result = self._run("top3")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("top3_invalid", result.stderr)
+        self.assertIn("top3_evidence_inconsistent", result.stderr)
         record = json.loads((self.root / "logs/runs/2026-10-04/diagnostic.json").read_text(encoding="utf-8"))
         self.assertFalse(record["format_repair_attempted"])
-        self.assertEqual(record["original_gate_reason"], "top3_invalid")
+        self.assertEqual(record["evidence_consistency_result"], "FAIL")
+        self.assertEqual(record["evidence_consistency_reason"], "top3_evidence_inconsistent")
+        self.assertEqual(record["original_gate_result"], "NOT_RUN")
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
         self.assertEqual(len(self.calls.read_text(encoding="utf-8").splitlines()), 1)
         self._assert_public_unchanged(before)
@@ -453,6 +471,7 @@ class GenerateReviewDraftTests(unittest.TestCase):
         response = json.dumps({
             "final_status": "NO_PUBLISH",
             "brief_markdown": "INSUFFICIENT_VERIFIED_ARTICLES",
+            "top3": [],
             "candidate_diagnostics": {"coverage": "PARTIAL", "candidates": [candidate]},
         }, ensure_ascii=False)
         self._write_executable(
@@ -522,6 +541,29 @@ class GenerateReviewDraftTests(unittest.TestCase):
         self.assertTrue((run_dir / gate["contract_repaired_brief_markdown"]).is_file())
         self.assertTrue((run_dir / gate["format_repaired_brief_markdown"]).is_file())
         self.assertEqual(self.calls.read_text(encoding="utf-8").splitlines(), ["GENERAL"])
+
+    def test_top3_candidate_mismatch_fails_before_quality_gate_without_retry_or_repair(self):
+        payload = json.loads(response_json(make_brief()))
+        wrong = "韓国の7〜9月期成長率が市場予想を上回った。"
+        payload["top3"][2]["headline"] = "South Korea economy grows faster than expected"
+        payload["top3"][2]["source_title"] = "South Korea economy grows faster than expected"
+        payload["top3"][2]["summary"] = wrong
+        payload["brief_markdown"] = payload["brief_markdown"].replace("3. Third distinct event.", f"3. {wrong}")
+        self._set_response(json.dumps(payload, ensure_ascii=False))
+        before = self._snapshot_public()
+        result = self._run("custom")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("top3_source_title_mismatch", result.stderr)
+        record = json.loads((self.root / "logs/runs/2026-10-04/diagnostic.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["evidence_consistency_result"], "FAIL")
+        self.assertEqual(record["evidence_consistency_reason"], "top3_source_title_mismatch")
+        self.assertTrue(any(item.get("candidate_title") == "Article 3"
+                            for item in record["evidence_consistency_details"]))
+        self.assertEqual(record["original_gate_result"], "NOT_RUN")
+        self.assertFalse(record["format_repair_attempted"])
+        self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
+        self.assertEqual(self.calls.read_text(encoding="utf-8").splitlines(), ["GENERAL"])
+        self._assert_public_unchanged(before)
 
     def test_failed_contract_repair_stops_before_quality_gate(self):
         body = make_brief() + "\n## Candidate Diagnostics\n\n| candidate_id | title |\n|---|---|\n| C1 | Article 1 |\n"
@@ -653,6 +695,9 @@ class GenerateReviewDraftTests(unittest.TestCase):
         self.assertIn("少なくとも3件", prompt)
         self.assertIn("現在のsearch stageで公開可能なBriefを構成できなかった", prompt)
         self.assertIn("candidate_diagnostics", prompt)
+        self.assertIn('"top3": [', prompt)
+        self.assertIn('"source_url": "candidate URL exact copy"', prompt)
+        self.assertIn("verified_summary", prompt)
         self.assertIn("本文へコピー・要約・表として再掲しません", prompt)
         self.assertIn("selected_for_top3", prompt)
         self.assertIn("候補診断表", prompt)

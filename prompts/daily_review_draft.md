@@ -48,6 +48,10 @@ brief_markdownでは、以下に列挙した`##`見出しだけを使い、表�
 
 Today's Top 3は異なる重要ニュースを番号 `1. `、`2. `、`3. ` でちょうど3件記載します。候補が十分にある場合は、世界的重要性を優先しつつ、同一ニュースの重複を避け、地域・テーマの偏りを抑えて選びます。Top 3では媒体名、英語タイトル、出典リンクを記載せず、詳細は分野別の章に記載してください。AI・テクノロジーと科学の章は毎回残し、該当記事がない場合は「今回は掲載候補なし」としてください。全カテゴリに記事があることをTop 3成立条件に加えてはいけません。
 
+Top 3とcandidate diagnosticsの対応を機械検証できるよう、JSONに`top3`配列を必ず含めます。PUBLISHでは異なる候補3件を順番どおりに記録し、各項目は`candidate_id`、`headline`、`source_title`、`source`、`source_url`、`summary`を持ちます。`headline`と`source_title`は、対応candidateの`title`を一字一句そのままコピーしてください（翻訳・言い換え禁止）。`source`と`source_url`も対応candidateからそのままコピーします。`candidate_id`はcandidate diagnosticsに存在し、`selected_for_top3=true`、`duplicate=false`、`rejection_reason=null`、`source_verified=true`、`within_24h=true`の候補だけを使います。選定候補は全体でちょうど3件とします。
+
+各candidateに`verified_summary`を追加します。Top 3で選定したcandidateの`verified_summary`は、その記事の確認済み内容だけを表す簡潔な日本語要約とし、対応する`top3[i].summary`へ一字一句そのままコピーします。非選定candidateでは`verified_summary`を`null`にします。brief_markdownのToday's Top 3の番号付き行は`top3[i].summary`と完全一致させ、順番も一致させます。候補のheadline、記事内容、source、URLを別candidateから混ぜてはいけません。candidateごとに記事を個別に確認し、候補診断の`verified_summary`と記事`title`が別ニュースを示すような矛盾がないことを出力前に確認してください。
+
 各記事は日本語の短い説明に加え、「何が起きたか」「なぜ重要か」「今後の注目点」を自然な文章で含めます。1記事につき公式個別記事URLは1件だけ、Brief全体では3件以上の相異なるURLを使い、重複URLを使いません。リンク先媒体名とドメインを一致させ、転載先を通信社の原文と表記しないでください。記事末尾は必ず次の3行形式にしてください。
 
 英語記事タイトル：Original English Headline
@@ -70,6 +74,32 @@ Tomorrow's Watchlistは3〜5項目。全体を落ち着いた日本語で簡潔�
 {
   "final_status": "PUBLISH",
   "brief_markdown": "_Date: YYYY-MM-DD_\n...完成Brief本文...",
+  "top3": [
+    {
+      "candidate_id": "C1",
+      "headline": "candidate title exact copy",
+      "source_title": "candidate title exact copy",
+      "source": "candidate source exact copy",
+      "source_url": "candidate URL exact copy",
+      "summary": "brief_markdownのToday's Top 3にそのまま記載した要約"
+    },
+    {
+      "candidate_id": "C2",
+      "headline": "candidate title exact copy",
+      "source_title": "candidate title exact copy",
+      "source": "candidate source exact copy",
+      "source_url": "candidate URL exact copy",
+      "summary": "brief_markdownのToday's Top 3にそのまま記載した要約"
+    },
+    {
+      "candidate_id": "C3",
+      "headline": "candidate title exact copy",
+      "source_title": "candidate title exact copy",
+      "source": "candidate source exact copy",
+      "source_url": "candidate URL exact copy",
+      "summary": "brief_markdownのToday's Top 3にそのまま記載した要約"
+    }
+  ],
   "candidate_diagnostics": {
     "coverage": "UNKNOWN",
     "candidates": []
@@ -102,12 +132,15 @@ rejection_reason
 | ID | 記事 | 公開日時 | 24時間以内 | 採否・理由 |
 ```
 
+NO_PUBLISH時は`top3`を空配列にします。PUBLISHでは上記の形式で3項目を返します。
+
 NO_PUBLISH時の例：
 
 ```json
 {
   "final_status": "NO_PUBLISH",
   "brief_markdown": "INSUFFICIENT_VERIFIED_ARTICLES",
+  "top3": [],
   "candidate_diagnostics": {
     "coverage": "PARTIAL",
     "candidates": []
@@ -124,6 +157,7 @@ NO_PUBLISH時の例：
   "source": null,
   "url": null,
   "published_at": "UNKNOWN",
+  "verified_summary": null,
   "within_24h": "UNKNOWN",
   "source_verified": "UNKNOWN",
   "duplicate": "UNKNOWN",

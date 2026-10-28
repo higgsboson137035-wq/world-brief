@@ -172,12 +172,20 @@ class RunDiagnosticsTests(unittest.TestCase):
         original_brief = root / "original-brief.md"
         repaired_brief = root / "contract-repaired-brief.md"
         format_brief = root / "format-repaired-brief.md"
+        evidence = root / "evidence-consistency.json"
         raw.write_text('{"final_status":"PUBLISH"}', encoding="utf-8")
         original_json.write_text(raw.read_text(encoding="utf-8"), encoding="utf-8")
         repaired_json.write_text('{"final_status":"PUBLISH","repaired":true}', encoding="utf-8")
         original_brief.write_text("## Candidate Diagnostics\n", encoding="utf-8")
         repaired_brief.write_text("Human-readable brief", encoding="utf-8")
         format_brief.write_text("Format-repaired brief", encoding="utf-8")
+        evidence.write_text(json.dumps({
+            "top3_candidate_ids": ["C1", "C2", "C3"],
+            "selected_candidate_ids": ["C1", "C2", "C3"],
+            "evidence_consistency_result": "PASS",
+            "evidence_consistency_reason": "pass",
+            "evidence_consistency_details": [],
+        }), encoding="utf-8")
         candidate.write_text('{"status":"RECORDED","coverage":"PARTIAL","candidates":[]}', encoding="utf-8")
         gate.write_text("pass", encoding="utf-8")
         diagnostics.record_attempt(
@@ -192,6 +200,7 @@ class RunDiagnosticsTests(unittest.TestCase):
                                "contract_repair_reason": "candidate_diagnostics_embedded_in_brief_markdown"},
             original_json_output=original_json, contract_repaired_json=repaired_json,
             contract_original_brief=original_brief, contract_repaired_brief=repaired_brief,
+            evidence_consistency_output=evidence,
         )
         directory = diagnostics.run_dir(self.run_date)
         record = json.loads(diagnostics.record_path(self.run_date).read_text(encoding="utf-8"))
@@ -214,6 +223,12 @@ class RunDiagnosticsTests(unittest.TestCase):
         self.assertEqual(attempt["contract_original_brief_markdown"], "attempt-1-original-brief-markdown.md")
         self.assertEqual(attempt["contract_repaired_brief_markdown"], "attempt-1-contract-repaired-brief-markdown.md")
         self.assertEqual(attempt["format_repaired_brief_markdown"], "attempt-1-format-repaired-brief-markdown.md")
+        saved_evidence = json.loads((directory / "attempt-1-evidence-consistency.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved_evidence["evidence_consistency_result"], "PASS")
+        self.assertEqual(record["top3_candidate_ids"], ["C1", "C2", "C3"])
+        self.assertEqual(record["selected_candidate_ids"], ["C1", "C2", "C3"])
+        self.assertEqual(record["evidence_consistency_result"], "PASS")
+        self.assertEqual(record["evidence_consistency_reason"], "pass")
 
     def test_rendered_trusted_source_prompt_has_individual_queries_and_no_template_markers(self):
         template = Path(__file__).resolve().parents[1] / "prompts/daily_review_draft.md"

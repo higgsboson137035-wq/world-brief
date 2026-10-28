@@ -76,6 +76,11 @@ def _validate_envelope(envelope: dict) -> tuple[str, str, dict]:
         raise ContractError("no_publish_brief_invalid")
     if final_status == "PUBLISH" and body.strip() == "INSUFFICIENT_VERIFIED_ARTICLES":
         raise ContractError("publish_brief_is_sentinel")
+    top3 = envelope.get("top3")
+    if not isinstance(top3, list):
+        raise ContractError("top3_schema_invalid")
+    if final_status == "NO_PUBLISH" and top3:
+        raise ContractError("no_publish_top3_invalid")
 
     block = envelope.get("candidate_diagnostics")
     if not isinstance(block, dict):

@@ -209,6 +209,11 @@ def start_run(
         "contract_repair_attempted": False,
         "contract_repair_result": "NOT_ATTEMPTED",
         "contract_repair_reason": "NOT_ATTEMPTED",
+        "top3_candidate_ids": [],
+        "selected_candidate_ids": [],
+        "evidence_consistency_result": "NOT_RUN",
+        "evidence_consistency_reason": "NOT_RUN",
+        "evidence_consistency_details": [],
         "search_stage": None,
         "search_strategy": None,
         "query_family": None,
@@ -236,6 +241,7 @@ def record_attempt(
     contract_repaired_json: Path | None = None,
     contract_original_brief: Path | None = None,
     contract_repaired_brief: Path | None = None,
+    evidence_consistency_output: Path | None = None,
 ) -> None:
     value = load_record(run_date, run_id)
     directory = run_dir(run_date, run_id)
@@ -250,6 +256,7 @@ def record_attempt(
     contract_original_brief_target = directory / f"attempt-{number}-original-brief-markdown.md"
     contract_repaired_brief_target = directory / f"attempt-{number}-contract-repaired-brief-markdown.md"
     format_repaired_brief_target = directory / f"attempt-{number}-format-repaired-brief-markdown.md"
+    evidence_consistency_target = directory / f"attempt-{number}-evidence-consistency.json"
     atomic_copy(raw_output, raw_target)
     atomic_copy(gate_output, final_target)
     if original_json_output is not None and original_json_output.exists():
@@ -260,6 +267,23 @@ def record_attempt(
         atomic_copy(contract_original_brief, contract_original_brief_target)
     if contract_repaired_brief is not None and contract_repaired_brief.exists():
         atomic_copy(contract_repaired_brief, contract_repaired_brief_target)
+    evidence_consistency = {
+        "top3_candidate_ids": [],
+        "selected_candidate_ids": [],
+        "evidence_consistency_result": "NOT_RUN",
+        "evidence_consistency_reason": "NOT_RUN",
+        "evidence_consistency_details": [],
+    }
+    if evidence_consistency_output is not None and evidence_consistency_output.exists():
+        atomic_copy(evidence_consistency_output, evidence_consistency_target)
+        try:
+            evidence_consistency = json.loads(evidence_consistency_target.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            evidence_consistency = {
+                **evidence_consistency,
+                "evidence_consistency_result": "FAIL",
+                "evidence_consistency_reason": "evidence_consistency_diagnostics_invalid",
+            }
     if original_output is not None and original_output.exists():
         atomic_copy(original_output, original_target)
     try:
@@ -319,6 +343,10 @@ def record_attempt(
         "gate_reason": gate_reason,
         "sentinel_seen": sentinel_seen,
         "candidate_diagnostics_status": candidate_status,
+        **evidence_consistency,
+        "evidence_consistency_output": (
+            evidence_consistency_target.name if evidence_consistency_target.exists() else None
+        ),
         **contract,
         **repair,
     }
@@ -351,6 +379,11 @@ def record_attempt(
     value["search_strategy"] = strategy
     value["query_family"] = query_family
     value["candidate_count"] = gate["candidate_count"]
+    for key in (
+        "top3_candidate_ids", "selected_candidate_ids", "evidence_consistency_result",
+        "evidence_consistency_reason", "evidence_consistency_details",
+    ):
+        value[key] = evidence_consistency.get(key)
     for key in (
         "json_contract_result", "json_contract_reason", "contract_repair_attempted",
         "contract_repair_result", "contract_repair_reason", "original_json_output",
@@ -535,6 +568,7 @@ def main() -> int:
     attempt.add_argument("--contract-repaired-json", type=Path)
     attempt.add_argument("--contract-original-brief", type=Path)
     attempt.add_argument("--contract-repaired-brief", type=Path)
+    attempt.add_argument("--evidence-consistency-output", type=Path)
     extract = sub.add_parser("extract")
     extract.add_argument("raw_output", type=Path)
     extract.add_argument("brief_output", type=Path)
@@ -593,7 +627,7 @@ def main() -> int:
                            args.original_output, args.repaired_output, repair_metadata,
                            args.run_id, contract_metadata, args.original_json_output,
                            args.contract_repaired_json, args.contract_original_brief,
-                           args.contract_repaired_brief)
+                           args.contract_repaired_brief, args.evidence_consistency_output)
         elif args.command == "extract":
             status, diag = extract_response(args.raw_output, args.brief_output, args.candidate_output)
             print(f"{status} {diag}")

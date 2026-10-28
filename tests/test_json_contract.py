@@ -12,13 +12,18 @@ from scripts.json_contract import (
 )
 
 
-def candidate():
+def candidate(index=1):
+    sources = [("Reuters", "https://www.reuters.com/world/one"),
+               ("AP News", "https://apnews.com/article/two"),
+               ("BBC", "https://www.bbc.com/news/articles/three")]
+    source, url = sources[index - 1]
     return {
-        "candidate_id": "C1",
-        "title": "One verified story",
-        "source": "Reuters",
-        "url": "https://www.reuters.com/world/one",
+        "candidate_id": f"C{index}",
+        "title": f"Verified source story {index}",
+        "source": source,
+        "url": url,
         "published_at": "2026-10-27 06:00 UTC",
+        "verified_summary": f"Story summary {index}.",
         "within_24h": True,
         "source_verified": True,
         "duplicate": False,
@@ -27,11 +32,28 @@ def candidate():
     }
 
 
-def envelope(body):
+def candidates():
+    return [candidate(index) for index in range(1, 4)]
+
+
+def top3_items(candidate_data):
+    return [{
+        "candidate_id": item["candidate_id"],
+        "headline": item["title"],
+        "source_title": item["title"],
+        "source": item["source"],
+        "source_url": item["url"],
+        "summary": item["verified_summary"],
+    } for item in candidate_data]
+
+
+def envelope(body, candidate_data=None, top3=None):
+    candidate_data = candidates() if candidate_data is None else candidate_data
     return {
         "final_status": "PUBLISH",
         "brief_markdown": body,
-        "candidate_diagnostics": {"coverage": "PARTIAL", "candidates": [candidate()]},
+        "top3": top3_items(candidate_data) if top3 is None else top3,
+        "candidate_diagnostics": {"coverage": "PARTIAL", "candidates": candidate_data},
     }
 
 
@@ -39,7 +61,7 @@ class JsonContractTests(unittest.TestCase):
     def setUp(self):
         self.body = (
             "_Date: 2026-10-27_\n\n## Today's Top 3\n\n"
-            "1. First story.\n2. Second story.\n3. Third story.\n\n"
+            "1. Story summary 1.\n2. Story summary 2.\n3. Story summary 3.\n\n"
             "## Executive Summary\n\nMarkets changed after a central bank decision.\n\n"
             "## Why It Matters\n\nThis affects trade.\n\n"
             "## Big Picture\n\nPolicy and markets interact.\n\n"
@@ -60,7 +82,7 @@ class JsonContractTests(unittest.TestCase):
         value = envelope(self.body)
         status, _, saved = validate_envelope(value)
         self.assertEqual(status, "PUBLISH")
-        self.assertEqual(saved["candidates"], [candidate()])
+        self.assertEqual(saved["candidates"], candidates())
 
     def test_diagnostics_section_is_contract_repairable_and_removed(self):
         contaminated = self.body + (
@@ -106,6 +128,10 @@ class JsonContractTests(unittest.TestCase):
 
     def test_json_contract_requires_all_envelope_fields_and_candidate_shape(self):
         value = envelope(self.body)
+        del value["top3"]
+        with self.assertRaisesRegex(ContractError, "top3_schema_invalid"):
+            validate_envelope(value)
+        value = envelope(self.body)
         del value["candidate_diagnostics"]
         with self.assertRaisesRegex(ContractError, "candidate_diagnostics_missing_or_invalid"):
             validate_envelope(value)
@@ -121,6 +147,7 @@ class JsonContractTests(unittest.TestCase):
     def test_no_publish_json_sentinel_is_valid(self):
         value = envelope("INSUFFICIENT_VERIFIED_ARTICLES")
         value["final_status"] = "NO_PUBLISH"
+        value["top3"] = []
         value["candidate_diagnostics"] = {"coverage": "UNKNOWN", "candidates": []}
         self.assertEqual(validate_envelope(value)[0], "NO_PUBLISH")
 
