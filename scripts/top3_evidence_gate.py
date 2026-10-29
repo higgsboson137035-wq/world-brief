@@ -142,9 +142,10 @@ def validate_consistency(envelope: dict, brief: str) -> dict:
                 "structured_summary": item.get("summary"), "brief_top3_text": body_summary,
             })
 
-    if top3_ids != selected_ids:
+    if (len(top3_ids) != 3 or len(selected_ids) != 3
+            or set(top3_ids) != set(selected_ids)):
         fail("top3_candidate_not_selected", {
-            "reason": "top3_ids_must_match_selected_ids_in_order",
+            "reason": "top3_candidate_set_mismatch",
             "top3_candidate_ids": top3_ids, "selected_candidate_ids": selected_ids,
         })
     return {

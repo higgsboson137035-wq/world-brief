@@ -1,3 +1,5 @@
+import json
+from pathlib import Path
 import unittest
 
 from scripts.format_repair import repair_text
@@ -63,6 +65,62 @@ class Top3EvidenceGateTests(unittest.TestCase):
         self.assertEqual(report["evidence_consistency_result"], "PASS")
         self.assertEqual(report["top3_candidate_ids"], ["C1", "C2", "C3"])
         self.assertEqual(report["selected_candidate_ids"], ["C1", "C2", "C3"])
+
+    def test_same_selected_set_passes_when_diagnostics_array_order_differs(self):
+        envelope, brief = base_data()
+        candidates = envelope["candidate_diagnostics"]["candidates"]
+        candidates[1], candidates[2] = candidates[2], candidates[1]
+        report = validate_consistency(envelope, brief)
+        self.assertEqual(report["evidence_consistency_result"], "PASS")
+        self.assertEqual(report["top3_candidate_ids"], ["C1", "C2", "C3"])
+        self.assertEqual(report["selected_candidate_ids"], ["C1", "C3", "C2"])
+
+    def test_different_selected_set_still_fails(self):
+        envelope, brief = base_data()
+        candidates = envelope["candidate_diagnostics"]["candidates"]
+        candidates[2]["selected_for_top3"] = False
+        candidates[2]["rejection_reason"] = "top3_not_selected"
+        candidates.append(candidate("C4", "Fourth story", "Reuters", "https://reuters.com/d", "Fourth summary."))
+        report = validate_consistency(envelope, brief)
+        self.assertEqual(report["evidence_consistency_result"], "FAIL")
+        self.assertEqual(report["evidence_consistency_reason"], "top3_candidate_not_selected")
+        self.assertEqual(report["evidence_consistency_details"][-1]["reason"], "top3_candidate_set_mismatch")
+
+    def test_four_selected_candidates_fail(self):
+        envelope, brief = base_data()
+        envelope["candidate_diagnostics"]["candidates"].append(
+            candidate("C4", "Fourth story", "Reuters", "https://reuters.com/d", "Fourth summary.")
+        )
+        report = validate_consistency(envelope, brief)
+        self.assertEqual(report["evidence_consistency_result"], "FAIL")
+        self.assertEqual(report["evidence_consistency_reason"], "top3_candidate_not_selected")
+
+    def test_two_selected_candidates_fail(self):
+        envelope, brief = base_data()
+        envelope["candidate_diagnostics"]["candidates"][2]["selected_for_top3"] = False
+        envelope["candidate_diagnostics"]["candidates"][2]["rejection_reason"] = "top3_not_selected"
+        report = validate_consistency(envelope, brief)
+        self.assertEqual(report["evidence_consistency_result"], "FAIL")
+        self.assertEqual(report["evidence_consistency_reason"], "top3_candidate_not_selected")
+
+    def test_brief_top3_order_must_match_structured_top3(self):
+        envelope, brief = base_data()
+        summaries = [item["summary"] for item in envelope["top3"]]
+        swapped = brief.replace(f"2. {summaries[1]}", "2. TEMP")
+        swapped = swapped.replace(f"3. {summaries[2]}", f"3. {summaries[1]}")
+        swapped = swapped.replace("2. TEMP", f"2. {summaries[2]}")
+        report = validate_consistency(envelope, swapped)
+        self.assertEqual(report["evidence_consistency_result"], "FAIL")
+        self.assertEqual(report["evidence_consistency_reason"], "top3_evidence_inconsistent")
+
+    def test_2026_10_29_run02_saved_output_passes_after_order_fix(self):
+        run_dir = Path(__file__).resolve().parents[1] / "logs/runs/2026-10-29/run-02"
+        envelope = json.loads((run_dir / "attempt-1-original-json-output.json").read_text(encoding="utf-8"))
+        brief = (run_dir / "attempt-1-original-brief-markdown.md").read_text(encoding="utf-8")
+        report = validate_consistency(envelope, brief)
+        self.assertEqual(report["evidence_consistency_result"], "PASS", report)
+        self.assertEqual(report["top3_candidate_ids"], ["C2", "C5", "C3"])
+        self.assertEqual(set(report["top3_candidate_ids"]), set(report["selected_candidate_ids"]))
 
     def test_missing_candidate_id_fails(self):
         envelope, brief = base_data()
