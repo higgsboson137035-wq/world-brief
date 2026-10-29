@@ -225,6 +225,16 @@ def start_run(
         "commit_type": None,
         "push_attempted": False,
         "push_result": "NOT_ATTEMPTED",
+        "stage_candidate_count": None,
+        "stage_eligible_count": None,
+        "cumulative_candidate_count": 0,
+        "cumulative_eligible_count": 0,
+        "cumulative_candidate_ids": [],
+        "cumulative_eligible_ids": [],
+        "selection_inconsistent": False,
+        "selection_repair_attempted": False,
+        "selection_repair_result": "NOT_ATTEMPTED",
+        "selection_repair_reason": "NOT_ATTEMPTED",
     }
     atomic_json(record_path(run_date, run_id), value)
 
@@ -242,6 +252,9 @@ def record_attempt(
     contract_original_brief: Path | None = None,
     contract_repaired_brief: Path | None = None,
     evidence_consistency_output: Path | None = None,
+    candidate_pool_metadata: Path | None = None,
+    selection_repair_output: Path | None = None,
+    selection_repair_metadata: dict | None = None,
 ) -> None:
     value = load_record(run_date, run_id)
     directory = run_dir(run_date, run_id)
@@ -331,6 +344,22 @@ def record_attempt(
             format_repaired_brief_target.name if format_repaired_brief_target.exists() else None
         ),
     })
+    pool_metadata = {}
+    if candidate_pool_metadata is not None and candidate_pool_metadata.exists():
+        try:
+            pool_metadata = json.loads(candidate_pool_metadata.read_text(encoding="utf-8"))
+            atomic_copy(candidate_pool_metadata, directory / f"attempt-{number}-cumulative-candidates.json")
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            pool_metadata = {"candidate_pool_result": "DIAGNOSTIC_READ_FAILED"}
+    selection_output_target = directory / f"attempt-{number}-selection-repair-output.json"
+    if selection_repair_output is not None and selection_repair_output.exists():
+        atomic_copy(selection_repair_output, selection_output_target)
+    selection_metadata = selection_repair_metadata or {
+        "selection_inconsistent": False,
+        "selection_repair_attempted": False,
+        "selection_repair_result": "NOT_ATTEMPTED",
+        "selection_repair_reason": "NOT_ATTEMPTED",
+    }
     gate = {
         "attempt": number,
         "search_stage": search_stage,
@@ -349,6 +378,12 @@ def record_attempt(
         ),
         **contract,
         **repair,
+        **{key: pool_metadata.get(key) for key in (
+            "stage_candidate_count", "stage_eligible_count", "cumulative_candidate_count",
+            "cumulative_eligible_count", "cumulative_candidate_ids", "cumulative_eligible_ids",
+        )},
+        "selection_repair_output": selection_output_target.name if selection_output_target.exists() else None,
+        **selection_metadata,
     }
     atomic_json(gate_target, gate)
     attempts = [item for item in value.get("attempts", []) if item.get("attempt") != number]
@@ -384,6 +419,14 @@ def record_attempt(
         "evidence_consistency_reason", "evidence_consistency_details",
     ):
         value[key] = evidence_consistency.get(key)
+    for key in (
+        "stage_candidate_count", "stage_eligible_count", "cumulative_candidate_count",
+        "cumulative_eligible_count", "cumulative_candidate_ids", "cumulative_eligible_ids",
+    ):
+        value[key] = pool_metadata.get(key)
+    for key, default in (("selection_inconsistent", False), ("selection_repair_attempted", False),
+                         ("selection_repair_result", "NOT_ATTEMPTED"), ("selection_repair_reason", "NOT_ATTEMPTED")):
+        value[key] = selection_metadata.get(key, default)
     for key in (
         "json_contract_result", "json_contract_reason", "contract_repair_attempted",
         "contract_repair_result", "contract_repair_reason", "original_json_output",
@@ -569,6 +612,11 @@ def main() -> int:
     attempt.add_argument("--contract-original-brief", type=Path)
     attempt.add_argument("--contract-repaired-brief", type=Path)
     attempt.add_argument("--evidence-consistency-output", type=Path)
+    attempt.add_argument("--candidate-pool-metadata", type=Path)
+    attempt.add_argument("--selection-repair-output", type=Path)
+    attempt.add_argument("--selection-repair-attempted", choices=("true", "false"), default="false")
+    attempt.add_argument("--selection-repair-result", default="NOT_ATTEMPTED")
+    attempt.add_argument("--selection-repair-reason", default="NOT_ATTEMPTED")
     extract = sub.add_parser("extract")
     extract.add_argument("raw_output", type=Path)
     extract.add_argument("brief_output", type=Path)
@@ -627,7 +675,13 @@ def main() -> int:
                            args.original_output, args.repaired_output, repair_metadata,
                            args.run_id, contract_metadata, args.original_json_output,
                            args.contract_repaired_json, args.contract_original_brief,
-                           args.contract_repaired_brief, args.evidence_consistency_output)
+                           args.contract_repaired_brief, args.evidence_consistency_output,
+                           args.candidate_pool_metadata, args.selection_repair_output, {
+                               "selection_inconsistent": args.selection_repair_attempted == "true",
+                               "selection_repair_attempted": args.selection_repair_attempted == "true",
+                               "selection_repair_result": args.selection_repair_result,
+                               "selection_repair_reason": args.selection_repair_reason,
+                           })
         elif args.command == "extract":
             status, diag = extract_response(args.raw_output, args.brief_output, args.candidate_output)
             print(f"{status} {diag}")

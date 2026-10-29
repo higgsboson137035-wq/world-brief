@@ -16,6 +16,7 @@ DIAGNOSTICS = ROOT / "scripts" / "run_diagnostics.py"
 REPAIR = ROOT / "scripts" / "format_repair.py"
 JSON_CONTRACT = ROOT / "scripts" / "json_contract.py"
 EVIDENCE_GATE = ROOT / "scripts" / "top3_evidence_gate.py"
+CANDIDATE_POOL = ROOT / "scripts" / "candidate_pool.py"
 
 
 def make_brief(duplicate=False, missing_top3=False, japan_heading_only=False, japan_short=False, japan_shallow=False, extra_heading=False):
@@ -150,6 +151,7 @@ class GenerateReviewDraftTests(unittest.TestCase):
         shutil.copy2(REPAIR, self.root / "scripts" / REPAIR.name)
         shutil.copy2(JSON_CONTRACT, self.root / "scripts" / JSON_CONTRACT.name)
         shutil.copy2(EVIDENCE_GATE, self.root / "scripts" / EVIDENCE_GATE.name)
+        shutil.copy2(CANDIDATE_POOL, self.root / "scripts" / CANDIDATE_POOL.name)
         shutil.copy2(PROMPT, self.root / "prompts" / PROMPT.name)
         self.fake_bin = self.root / "fake-bin"
         self.fake_bin.mkdir()
@@ -422,6 +424,72 @@ class GenerateReviewDraftTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("FAILED_JSON_CONTRACT", result.stderr)
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
+        self._assert_public_unchanged(before)
+
+    def test_cumulative_eligible_pool_runs_one_no_search_selection_repair(self):
+        def pool_candidate(cid, slug):
+            return {
+                "candidate_id": cid, "title": f"Evidence item {slug}", "source": "Associated Press",
+                "url": f"https://apnews.com/article/{slug}", "published_at": "2026-10-04T06:00:00Z",
+                "within_24h": True, "source_verified": True, "duplicate": False,
+                "selected_for_top3": False, "rejection_reason": "top3_not_selected", "verified_summary": None,
+            }
+
+        def sentinel(candidates):
+            return json.dumps({"final_status": "NO_PUBLISH", "brief_markdown": "INSUFFICIENT_VERIFIED_ARTICLES",
+                               "top3": [], "candidate_diagnostics": {"coverage": "PARTIAL", "candidates": candidates}},
+                              ensure_ascii=False)
+
+        body = make_brief()
+        summaries = ["First distinct event.", "Second distinct event.", "Third distinct event."]
+        sources = [("Associated Press", "https://apnews.com/article/pool-a"),
+                   ("Associated Press", "https://apnews.com/article/pool-b"),
+                   ("Associated Press", "https://apnews.com/article/pool-c")]
+        selected = []
+        for index, (source, url) in enumerate(sources, 1):
+            selected.append({"candidate_id": f"P{index}", "title": f"Evidence item pool-{chr(96 + index)}", "source": source, "url": url,
+                             "published_at": "2026-10-04T06:00:00Z", "verified_summary": summaries[index-1],
+                             "within_24h": True, "source_verified": True, "duplicate": False,
+                             "selected_for_top3": True, "rejection_reason": None})
+        selection_response = response_json(body, diagnostics={"coverage": "COMPLETE", "candidates": selected})
+        one = sentinel([pool_candidate("C1", "pool-a"), pool_candidate("C2", "pool-b")])
+        two = sentinel([pool_candidate("C1", "pool-c")])
+        three = sentinel([pool_candidate("C1", "pool-d")])
+        script = (
+            "#!/bin/sh\nPROMPT=$(cat)\nprintf '%s\\n' \"$*\" >> \"$WORLD_BRIEF_TEST_ARGS\"\n"
+            "STAGE=$(printf '%s\\n' \"$PROMPT\" | sed -n 's/^SEARCH_STAGE=//p')\n"
+            "if [ -z \"$STAGE\" ]; then " + f"printf '%s' {self._shell_quote(selection_response)}; exit 0; fi\n"
+            "case \"$STAGE\" in\n"
+            f"GENERAL) printf '%s' {self._shell_quote(one)} ;;\n"
+            f"TRUSTED_SOURCES) printf '%s' {self._shell_quote(two)} ;;\n"
+            f"CATEGORY_EXPANSION) printf '%s' {self._shell_quote(three)} ;;\n"
+            "esac\n"
+        )
+        self._write_executable(self.codex, script)
+        before = self._snapshot_public()
+        env = os.environ.copy()
+        env.update({"PATH": str(self.fake_bin) + os.pathsep + env.get("PATH", ""),
+                    "WORLD_BRIEF_CODEX_BIN": str(self.codex), "WORLD_BRIEF_PYTHON_BIN": str(self.python),
+                    "WORLD_BRIEF_TEST_CALLS": str(self.calls), "WORLD_BRIEF_TEST_ARGS": str(self.root / "codex-args"),
+                    "WORLD_BRIEF_TEST_GIT_MARKER": str(self.git_marker)})
+        result = subprocess.run(["/bin/bash", str(self.root / "scripts" / SCRIPT.name)], cwd=self.root,
+                                env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25)
+        record_path = self.root / "logs/runs/2026-10-04/diagnostic.json"
+        self.assertTrue(record_path.exists(), result.stderr)
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        attempt = record["attempts"][-1]
+        self.assertTrue(attempt["selection_inconsistent"])
+        self.assertTrue(attempt["selection_repair_attempted"])
+        self.assertEqual(attempt["selection_repair_result"], "PASS")
+        self.assertEqual(attempt["cumulative_eligible_count"], 3)
+        self.assertEqual(attempt["top3_candidate_ids"], ["P1", "P2", "P3"])
+        self.assertEqual(attempt["evidence_consistency_result"], "PASS")
+        self.assertEqual(attempt["gate_result"], "PASS")
+        args = (self.root / "codex-args").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(args), 3)
+        self.assertTrue(all("--search" in line for line in args[:2]))
+        self.assertNotIn("--search", args[2])
+        self.assertEqual([a["search_stage"] for a in record["attempts"]], ["GENERAL", "TRUSTED_SOURCES"])
         self._assert_public_unchanged(before)
 
     def test_exact_insufficient_sentinel_advances_through_distinct_search_stages(self):

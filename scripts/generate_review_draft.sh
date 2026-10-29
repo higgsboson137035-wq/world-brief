@@ -69,6 +69,8 @@ DIAGNOSTICS="$ROOT/scripts/run_diagnostics.py"
 FORMAT_REPAIR="$ROOT/scripts/format_repair.py"
 JSON_CONTRACT="$ROOT/scripts/json_contract.py"
 EVIDENCE_GATE="$ROOT/scripts/top3_evidence_gate.py"
+CANDIDATE_POOL="$ROOT/scripts/candidate_pool.py"
+CUMULATIVE_POOL="$WORK_DIR/cumulative-candidates.json"
 RUN_DIAGNOSTIC_DIR="$ROOT/logs/runs/$TODAY"
 if [[ "$RUN_ID" == "run-02" ]]; then RUN_DIAGNOSTIC_DIR="$RUN_DIAGNOSTIC_DIR/run-02"; fi
 
@@ -102,20 +104,34 @@ validate_brief() {
 
 run_codex() {
     local rendered_prompt="$1"
-    "$PYTHON_BIN" -B - "$CODEX_BIN" "$rendered_prompt" "$RAW_OUTPUT" "$CODEX_TIMEOUT_SECONDS" <<'PY'
+    local output_path="${2:-$RAW_OUTPUT}"
+    "$PYTHON_BIN" -B - "$CODEX_BIN" "$rendered_prompt" "$output_path" "$CODEX_TIMEOUT_SECONDS" <<'PY'
 import subprocess
 import sys
 
 binary, prompt_path, output_path, timeout = sys.argv[1:]
 try:
     with open(prompt_path, "rb") as prompt, open(output_path, "wb") as output:
-        result = subprocess.run(
-            [binary, "--search", "exec", "-"],
-            stdin=prompt,
-            stdout=output,
-            check=False,
-            timeout=int(timeout),
-        )
+        result = subprocess.run([binary, "--search", "exec", "-"], stdin=prompt, stdout=output, check=False, timeout=int(timeout))
+except subprocess.TimeoutExpired:
+    raise SystemExit(124)
+except OSError:
+    raise SystemExit(125)
+raise SystemExit(result.returncode)
+PY
+}
+
+run_codex_no_search() {
+    local rendered_prompt="$1"
+    local output_path="$2"
+    "$PYTHON_BIN" -B - "$CODEX_BIN" "$rendered_prompt" "$output_path" "$CODEX_TIMEOUT_SECONDS" <<'PY'
+import subprocess
+import sys
+
+binary, prompt_path, output_path, timeout = sys.argv[1:]
+try:
+    with open(prompt_path, "rb") as prompt, open(output_path, "wb") as output:
+        result = subprocess.run([binary, "exec", "-"], stdin=prompt, stdout=output, check=False, timeout=int(timeout))
 except subprocess.TimeoutExpired:
     raise SystemExit(124)
 except OSError:
@@ -137,6 +153,17 @@ for STAGE in GENERAL TRUSTED_SOURCES CATEGORY_EXPANSION; do
         CATEGORY_EXPANSION) STRATEGY=CATEGORY_EXPANSION; QUERY_FAMILY='geopolitics_conflict|world_politics_diplomacy|economy_energy|disasters|security|science_technology' ;;
     esac
     : > "$RAW_OUTPUT"
+    POOL_STATS="$WORK_DIR/candidate-pool-stage-${ATTEMPT}.json"
+    SELECTION_PROMPT="$WORK_DIR/selection-prompt-${ATTEMPT}.md"
+    SELECTION_RAW_OUTPUT="$WORK_DIR/selection-output-${ATTEMPT}.json"
+    SELECTION_BRIEF="$WORK_DIR/selection-brief-${ATTEMPT}.md"
+    SELECTION_CANDIDATES="$WORK_DIR/selection-candidates-${ATTEMPT}.json"
+    SELECTION_REPAIRED_JSON="$WORK_DIR/selection-contract-repaired-${ATTEMPT}.json"
+    SELECTION_REPAIRED_BRIEF="$WORK_DIR/selection-contract-repaired-brief-${ATTEMPT}.md"
+    SELECTION_REPAIRED_CANDIDATES="$WORK_DIR/selection-contract-repaired-candidates-${ATTEMPT}.json"
+    SELECTION_REPAIR_ATTEMPTED=false
+    SELECTION_REPAIR_RESULT=NOT_ATTEMPTED
+    SELECTION_REPAIR_REASON=NOT_ATTEMPTED
     RESPONSE_STATUS="UNKNOWN"
     CANDIDATE_STATUS="UNKNOWN"
     SENTINEL_SEEN="false"
@@ -219,10 +246,72 @@ for STAGE in GENERAL TRUSTED_SOURCES CATEGORY_EXPANSION; do
             printf '{"status":"UNKNOWN","coverage":"UNKNOWN","candidates":[]}\n' > "$CANDIDATE_OUTPUT"
         fi
         if [[ "$JSON_CONTRACT_RESULT" == "PASS" ]]; then
-            if [[ "$RESPONSE_STATUS" == "NO_PUBLISH" ]]; then
+            if ! "$PYTHON_BIN" -B "$CANDIDATE_POOL" update "$CUMULATIVE_POOL" "$CANDIDATE_OUTPUT" "$STAGE" "$POOL_STATS"; then
+                FAILURE_REASON="candidate_pool_update_failed"
+                GATE_RESULT="FAIL"
+                JSON_CONTRACT_RESULT="FAIL"
+            fi
+            if [[ "$JSON_CONTRACT_RESULT" == "PASS" && "$RESPONSE_STATUS" == "NO_PUBLISH" ]]; then
+                SENTINEL_SEEN="true"
+                CUMULATIVE_ELIGIBLE="$("$PYTHON_BIN" -B -c 'import json,sys; print(json.load(open(sys.argv[1]))["cumulative_eligible_count"])' "$POOL_STATS")"
+                if [[ "$CUMULATIVE_ELIGIBLE" -ge 3 ]]; then
+                    SELECTION_REPAIR_ATTEMPTED=true
+                    SELECTION_REPAIR_RESULT=FAIL
+                    SELECTION_REPAIR_REASON="selection_inconsistent"
+                    if "$PYTHON_BIN" -B "$CANDIDATE_POOL" selection-prompt "$CUMULATIVE_POOL" "$SELECTION_PROMPT" --date "$TODAY" && \
+                       run_codex_no_search "$SELECTION_PROMPT" "$SELECTION_RAW_OUTPUT"; then
+                        SELECTION_INFO="$("$PYTHON_BIN" -B "$JSON_CONTRACT" validate "$SELECTION_RAW_OUTPUT" "$SELECTION_BRIEF" "$SELECTION_CANDIDATES" 2>&1)"
+                        read -r SELECTION_STATUS SELECTION_REASON <<< "$SELECTION_INFO"
+                        if [[ "$SELECTION_STATUS" == "CONTRACT_REPAIRABLE" ]] && \
+                           "$PYTHON_BIN" -B "$JSON_CONTRACT" repair "$SELECTION_RAW_OUTPUT" "$SELECTION_REPAIRED_JSON" >/dev/null 2>&1; then
+                            SELECTION_INFO="$("$PYTHON_BIN" -B "$JSON_CONTRACT" validate "$SELECTION_REPAIRED_JSON" "$SELECTION_REPAIRED_BRIEF" "$SELECTION_REPAIRED_CANDIDATES" 2>&1)"
+                            read -r SELECTION_STATUS SELECTION_REASON <<< "$SELECTION_INFO"
+                            if [[ "$SELECTION_STATUS" == "PUBLISH" ]]; then
+                                VALIDATED_JSON="$SELECTION_REPAIRED_JSON"
+                                cp "$SELECTION_REPAIRED_BRIEF" "$GATE_OUTPUT"
+                                CANDIDATE_OUTPUT="$SELECTION_REPAIRED_CANDIDATES"
+                            fi
+                        elif [[ "$SELECTION_STATUS" == "PUBLISH" ]]; then
+                            VALIDATED_JSON="$SELECTION_RAW_OUTPUT"
+                            cp "$SELECTION_BRIEF" "$GATE_OUTPUT"
+                            CANDIDATE_OUTPUT="$SELECTION_CANDIDATES"
+                        fi
+                        if [[ "$SELECTION_STATUS" == "PUBLISH" ]]; then
+                            if [[ -f "$SELECTION_REPAIRED_JSON" && "$VALIDATED_JSON" == "$SELECTION_REPAIRED_JSON" ]]; then
+                                SELECTION_CHECK="$("$PYTHON_BIN" -B "$CANDIDATE_POOL" validate-selection "$CUMULATIVE_POOL" "$SELECTION_REPAIRED_JSON" 2>&1)"
+                            else
+                                SELECTION_CHECK="$("$PYTHON_BIN" -B "$CANDIDATE_POOL" validate-selection "$CUMULATIVE_POOL" "$SELECTION_RAW_OUTPUT" 2>&1)"
+                            fi
+                            if [[ "$SELECTION_CHECK" != "PASS" ]]; then
+                                SELECTION_STATUS="FAIL"
+                                SELECTION_REASON="${SELECTION_CHECK:-selection_candidate_pool_validation_failed}"
+                            fi
+                        fi
+                        if [[ "$SELECTION_STATUS" == "PUBLISH" ]]; then
+                            RESPONSE_STATUS="PUBLISH"
+                            JSON_CONTRACT_RESULT="PASS"
+                            JSON_CONTRACT_REASON="selection_only_repair_pass"
+                            SELECTION_REPAIR_RESULT=PASS
+                            SELECTION_REPAIR_REASON="selection_completed"
+                        else
+                            FAILURE_REASON="selection_repair_failed"
+                            GATE_RESULT="FAIL"
+                            SELECTION_REPAIR_REASON="${SELECTION_REASON:-selection_output_invalid}"
+                        fi
+                    else
+                        FAILURE_REASON="selection_repair_failed"
+                        GATE_RESULT="FAIL"
+                        SELECTION_REPAIR_REASON="selection_command_failed"
+                    fi
+                else
+                    FAILURE_REASON="no_publish_insufficient_verified_articles"
+                    GATE_RESULT="RETRY"
+                fi
+            fi
+            if [[ "$JSON_CONTRACT_RESULT" == "PASS" && "$RESPONSE_STATUS" == "NO_PUBLISH" ]]; then
                 FAILURE_REASON="no_publish_insufficient_verified_articles"
                 GATE_RESULT="RETRY"
-            else
+            elif [[ "$JSON_CONTRACT_RESULT" == "PASS" && "$RESPONSE_STATUS" == "PUBLISH" ]]; then
                 if EVIDENCE_INFO="$("$PYTHON_BIN" -B "$EVIDENCE_GATE" "$VALIDATED_JSON" \
                     "$GATE_OUTPUT" "$EVIDENCE_OUTPUT" 2>&1)"; then
                     read -r EVIDENCE_CONSISTENCY_RESULT EVIDENCE_CONSISTENCY_REASON <<< "$EVIDENCE_INFO"
@@ -289,6 +378,10 @@ for STAGE in GENERAL TRUSTED_SOURCES CATEGORY_EXPANSION; do
     if [[ "$RESPONSE_STATUS" == "NO_PUBLISH" || "$FAILURE_REASON" == "no_publish_insufficient_verified_articles" ]]; then
         SENTINEL_SEEN="true"
     fi
+    if [[ ! -f "$POOL_STATS" && "$FAILURE_REASON" != "candidate_pool_update_failed" ]]; then
+        printf '{"status":"UNKNOWN","coverage":"UNKNOWN","candidates":[]}\n' > "$CANDIDATE_OUTPUT"
+        "$PYTHON_BIN" -B "$CANDIDATE_POOL" update "$CUMULATIVE_POOL" "$CANDIDATE_OUTPUT" "$STAGE" "$POOL_STATS" || fail "candidate_pool_update_failed"
+    fi
     "$PYTHON_BIN" -B "$DIAGNOSTICS" attempt "$TODAY" "$ATTEMPT" "$CODEX_EXIT" \
         "$GATE_RESULT" "$FAILURE_REASON" "$SENTINEL_SEEN" "$CANDIDATE_STATUS" \
         "$RAW_OUTPUT" "$CANDIDATE_OUTPUT" "$GATE_OUTPUT" "$STAGE" "$STRATEGY" "$QUERY_FAMILY" \
@@ -310,6 +403,11 @@ for STAGE in GENERAL TRUSTED_SOURCES CATEGORY_EXPANSION; do
         --contract-original-brief "$CONTRACT_ORIGINAL_BRIEF" \
         --contract-repaired-brief "$CONTRACT_REPAIRED_BRIEF" \
         --evidence-consistency-output "$EVIDENCE_OUTPUT" \
+        --candidate-pool-metadata "$POOL_STATS" \
+        --selection-repair-output "$SELECTION_RAW_OUTPUT" \
+        --selection-repair-attempted "$SELECTION_REPAIR_ATTEMPTED" \
+        --selection-repair-result "$SELECTION_REPAIR_RESULT" \
+        --selection-repair-reason "$SELECTION_REPAIR_REASON" \
         --run-id "$RUN_ID" || fail "diagnostic_attempt_save_failed"
 
     if [[ "$FAILURE_REASON" == "pass" ]]; then

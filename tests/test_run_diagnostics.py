@@ -161,6 +161,33 @@ class RunDiagnosticsTests(unittest.TestCase):
         self.assertEqual(record["final_status"], "RETRIEVAL_EXHAUSTED")
         self.assertTrue(record["human_review_required"])
 
+    def test_candidate_pool_and_selection_repair_metadata_are_saved_per_attempt(self):
+        diagnostics.start_run(self.run_date)
+        root = Path(self.temp.name)
+        raw, candidate, gate, pool = [root / name for name in ("raw", "candidate.json", "gate.md", "pool.json")]
+        raw.write_text("INSUFFICIENT_VERIFIED_ARTICLES", encoding="utf-8")
+        candidate.write_text(json.dumps({"status": "RECORDED", "coverage": "PARTIAL", "candidates": []}), encoding="utf-8")
+        gate.write_text("INSUFFICIENT_VERIFIED_ARTICLES", encoding="utf-8")
+        pool.write_text(json.dumps({"stage_candidate_count": 4, "stage_eligible_count": 4,
+                                    "cumulative_candidate_count": 9, "cumulative_eligible_count": 4,
+                                    "cumulative_candidate_ids": ["P1", "P2", "P3", "P4"],
+                                    "cumulative_eligible_ids": ["P1", "P2", "P3", "P4"], "candidates": []}), encoding="utf-8")
+        diagnostics.record_attempt(self.run_date, 1, 0, "FAIL", "selection_repair_failed", True, "RECORDED",
+                                   raw, candidate, gate, "CATEGORY_EXPANSION", "CATEGORY_EXPANSION", "categories",
+                                   candidate_pool_metadata=pool,
+                                   selection_repair_metadata={"selection_inconsistent": True,
+                                                              "selection_repair_attempted": True,
+                                                              "selection_repair_result": "FAIL",
+                                                              "selection_repair_reason": "selection_output_invalid"})
+        record = json.loads(diagnostics.record_path(self.run_date).read_text(encoding="utf-8"))
+        attempt = json.loads((diagnostics.run_dir(self.run_date) / "attempt-1-gate.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["cumulative_eligible_count"], 4)
+        self.assertTrue(record["selection_inconsistent"])
+        self.assertEqual(record["selection_repair_reason"], "selection_output_invalid")
+        self.assertEqual(attempt["stage_candidate_count"], 4)
+        self.assertEqual(attempt["cumulative_candidate_ids"], ["P1", "P2", "P3", "P4"])
+        self.assertTrue((diagnostics.run_dir(self.run_date) / "attempt-1-cumulative-candidates.json").exists())
+
     def test_contract_repair_metadata_and_all_output_stages_are_saved(self):
         diagnostics.start_run(self.run_date)
         root = Path(self.temp.name)
