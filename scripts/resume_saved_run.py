@@ -25,10 +25,12 @@ try:
     from .json_contract import ContractError, parse_json, validate_envelope
     from .review_draft_gate import validate_text
     from .top3_evidence_gate import validate_consistency
+    from .article_completeness_repair import repair_envelope, validate_completeness
 except ImportError:  # Executed as a standalone script.
     from json_contract import ContractError, parse_json, validate_envelope
     from review_draft_gate import validate_text
     from top3_evidence_gate import validate_consistency
+    from article_completeness_repair import repair_envelope, validate_completeness
 
 
 RUN_ID_RE = re.compile(r"^run-\d{2}$")
@@ -182,6 +184,8 @@ def prepare_resume(root: Path, run_date: str, run_id: str, *, output_dir: Path |
         raise ResumeFailure("date_invalid") from exc
     if not RUN_ID_RE.fullmatch(run_id):
         raise ResumeFailure("run_id_invalid")
+    if run_id not in {"run-01", "run-02"}:
+        raise ResumeFailure("saved_run_not_found")
 
     if (root / "briefs" / f"{run_date}.md").exists() or (root / f"{run_date}.html").exists():
         raise ResumeFailure("public_date_artifact_exists")
@@ -197,7 +201,9 @@ def prepare_resume(root: Path, run_date: str, run_id: str, *, output_dir: Path |
     if any(p.exists() or p.is_symlink() for p in (draft_md, draft_html)):
         raise ResumeFailure("draft_already_exists")
 
-    run_dir = root / "logs" / "runs" / run_date / run_id
+    run_dir = root / "logs" / "runs" / run_date
+    if run_id == "run-02":
+        run_dir = run_dir / "run-02"
     if not run_dir.is_dir() or run_dir.is_symlink():
         raise ResumeFailure("saved_run_not_found")
     diagnostic_path = run_dir / "diagnostic.json"
@@ -224,7 +230,11 @@ def prepare_resume(root: Path, run_date: str, run_id: str, *, output_dir: Path |
         or diagnostic.get("final_gate_reason") == "top3_candidate_not_selected"
         or attempt.get("gate_reason") == "top3_candidate_not_selected"
     )
-    if not failed_evidence:
+    failed_article_completeness = (
+        diagnostic.get("final_gate_reason") == "article_source_metadata_invalid"
+        or attempt.get("gate_reason") == "article_source_metadata_invalid"
+    )
+    if not failed_evidence and not failed_article_completeness:
         raise ResumeFailure("saved_run_failure_not_resume_eligible")
 
     payload_path = _recorded_payload_path(run_dir, diagnostic)
@@ -237,6 +247,19 @@ def prepare_resume(root: Path, run_date: str, run_id: str, *, output_dir: Path |
         raise ResumeFailure("saved_payload_not_publish")
 
     evidence = validate_consistency(envelope, body)
+    if evidence.get("evidence_consistency_result") != "PASS":
+        raise ResumeFailure(f"evidence_consistency_failed:{evidence.get('evidence_consistency_reason')}")
+
+    completeness_repaired = False
+    if validate_completeness(envelope, body) != "PASS":
+        repaired = repair_envelope(envelope, body)
+        if repaired is None:
+            raise ResumeFailure("article_completeness_repair_failed")
+        envelope, body = repaired
+        completeness_repaired = True
+        if validate_envelope(envelope)[0] != "PUBLISH" or validate_completeness(envelope, body) != "PASS":
+            raise ResumeFailure("article_completeness_repair_validation_failed")
+        evidence = validate_consistency(envelope, body)
     if evidence.get("evidence_consistency_result") != "PASS":
         raise ResumeFailure(f"evidence_consistency_failed:{evidence.get('evidence_consistency_reason')}")
     quality = validate_text(body, run_date)
@@ -265,6 +288,7 @@ def prepare_resume(root: Path, run_date: str, run_id: str, *, output_dir: Path |
         "source_json": payload_path.name,
         "source_json_sha256": hashlib.sha256(payload_path.read_bytes()).hexdigest(),
         "resume_json_contract": "PASS",
+        "resume_article_completeness_repair": "PASS" if completeness_repaired else "NOT_NEEDED",
         "resume_evidence_consistency": evidence.get("evidence_consistency_result"),
         "resume_evidence_consistency_reason": evidence.get("evidence_consistency_reason"),
         "resume_quality_gate": quality,
@@ -297,7 +321,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"RESUME=READY date={result['date']} run={result['run_id']}")
     print(f"Markdown: {result['draft_markdown']}")
     print(f"HTML: {result['draft_html']}")
-    print(f"Provenance: {root / 'logs' / 'runs' / result['date'] / result['run_id'] / 'resume-publication.json'}")
+    provenance_dir = root / "logs" / "runs" / result["date"]
+    if result["run_id"] == "run-02":
+        provenance_dir = provenance_dir / "run-02"
+    print(f"Provenance: {provenance_dir / 'resume-publication.json'}")
     print("Publication: NOT_STARTED (invoke the existing publisher only after separate authorization)")
     return 0
 

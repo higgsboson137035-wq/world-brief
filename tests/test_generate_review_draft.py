@@ -17,6 +17,7 @@ REPAIR = ROOT / "scripts" / "format_repair.py"
 JSON_CONTRACT = ROOT / "scripts" / "json_contract.py"
 EVIDENCE_GATE = ROOT / "scripts" / "top3_evidence_gate.py"
 CANDIDATE_POOL = ROOT / "scripts" / "candidate_pool.py"
+ARTICLE_COMPLETENESS = ROOT / "scripts" / "article_completeness_repair.py"
 
 
 def make_brief(duplicate=False, missing_top3=False, japan_heading_only=False, japan_short=False, japan_shallow=False, extra_heading=False):
@@ -48,7 +49,7 @@ def make_brief(duplicate=False, missing_top3=False, japan_heading_only=False, ja
         ]
     article = lambda index: [
         f"英語記事タイトル：Article {index}",
-        f"情報源：Source {index}",
+        f"情報源：{['Reuters', 'AP', 'BBC'][index - 1]}",
         "",
         links[index - 1],
     ]
@@ -152,6 +153,7 @@ class GenerateReviewDraftTests(unittest.TestCase):
         shutil.copy2(JSON_CONTRACT, self.root / "scripts" / JSON_CONTRACT.name)
         shutil.copy2(EVIDENCE_GATE, self.root / "scripts" / EVIDENCE_GATE.name)
         shutil.copy2(CANDIDATE_POOL, self.root / "scripts" / CANDIDATE_POOL.name)
+        shutil.copy2(ARTICLE_COMPLETENESS, self.root / "scripts" / ARTICLE_COMPLETENESS.name)
         shutil.copy2(PROMPT, self.root / "prompts" / PROMPT.name)
         self.fake_bin = self.root / "fake-bin"
         self.fake_bin.mkdir()
@@ -369,7 +371,7 @@ class GenerateReviewDraftTests(unittest.TestCase):
         before = self._snapshot_public()
         result = self._run("japan_empty")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("japan_impact_empty", result.stderr)
+        self.assertIn("ARTICLE_COMPLETENESS_INVALID", result.stderr)
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
         self.assertEqual(len(self.calls.read_text(encoding="utf-8").splitlines()), 1)
         self._assert_public_unchanged(before)
@@ -397,7 +399,7 @@ class GenerateReviewDraftTests(unittest.TestCase):
         before = self._snapshot_public()
         result = self._run("duplicate")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("duplicate_source_url", result.stderr)
+        self.assertIn("ARTICLE_COMPLETENESS_INVALID", result.stderr)
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
         self._assert_public_unchanged(before)
 
@@ -451,6 +453,10 @@ class GenerateReviewDraftTests(unittest.TestCase):
                              "published_at": "2026-10-04T06:00:00Z", "verified_summary": summaries[index-1],
                              "within_24h": True, "source_verified": True, "duplicate": False,
                              "selected_for_top3": True, "rejection_reason": None})
+            body = body.replace(f"英語記事タイトル：Article {index}", f"英語記事タイトル：Evidence item pool-{chr(96 + index)}")
+            body = body.replace(f"情報源：{['Reuters', 'AP', 'BBC'][index - 1]}", f"情報源：{source}")
+            body = body.replace(["https://www.reuters.com/world/a", "https://apnews.com/article/b",
+                                 "https://www.bbc.com/news/articles/c"][index - 1], url)
         selection_response = response_json(body, diagnostics={"coverage": "COMPLETE", "candidates": selected})
         one = sentinel([pool_candidate("C1", "pool-a"), pool_candidate("C2", "pool-b")])
         two = sentinel([pool_candidate("C1", "pool-c")])

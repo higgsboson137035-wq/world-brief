@@ -23,7 +23,7 @@ class ResumeSavedRunTests(unittest.TestCase):
         (self.root / "drafts").mkdir(parents=True)
         (self.root / "briefs").mkdir()
         run_dir = self.root / "logs/runs" / DATE / RUN
-        shutil.copytree(SOURCE_RUN, run_dir)
+        shutil.copytree(SOURCE_RUN, run_dir, ignore=shutil.ignore_patterns("resume-publication.json"))
         self.run_dir = run_dir
         self.originals = {
             p.name: p.read_bytes() for p in run_dir.iterdir() if p.is_file()

@@ -69,6 +69,7 @@ DIAGNOSTICS="$ROOT/scripts/run_diagnostics.py"
 FORMAT_REPAIR="$ROOT/scripts/format_repair.py"
 JSON_CONTRACT="$ROOT/scripts/json_contract.py"
 EVIDENCE_GATE="$ROOT/scripts/top3_evidence_gate.py"
+ARTICLE_COMPLETENESS="$ROOT/scripts/article_completeness_repair.py"
 CANDIDATE_POOL="$ROOT/scripts/candidate_pool.py"
 CUMULATIVE_POOL="$WORK_DIR/cumulative-candidates.json"
 RUN_DIAGNOSTIC_DIR="$ROOT/logs/runs/$TODAY"
@@ -164,6 +165,8 @@ for STAGE in GENERAL TRUSTED_SOURCES CATEGORY_EXPANSION; do
     SELECTION_REPAIR_ATTEMPTED=false
     SELECTION_REPAIR_RESULT=NOT_ATTEMPTED
     SELECTION_REPAIR_REASON=NOT_ATTEMPTED
+    ARTICLE_COMPLETENESS_REPAIR_ATTEMPTED=false
+    ARTICLE_COMPLETENESS_REPAIR_RESULT=NOT_ATTEMPTED
     RESPONSE_STATUS="UNKNOWN"
     CANDIDATE_STATUS="UNKNOWN"
     SENTINEL_SEEN="false"
@@ -312,6 +315,7 @@ for STAGE in GENERAL TRUSTED_SOURCES CATEGORY_EXPANSION; do
                 FAILURE_REASON="no_publish_insufficient_verified_articles"
                 GATE_RESULT="RETRY"
             elif [[ "$JSON_CONTRACT_RESULT" == "PASS" && "$RESPONSE_STATUS" == "PUBLISH" ]]; then
+                GATE_RESULT="PASS"
                 if EVIDENCE_INFO="$("$PYTHON_BIN" -B "$EVIDENCE_GATE" "$VALIDATED_JSON" \
                     "$GATE_OUTPUT" "$EVIDENCE_OUTPUT" 2>&1)"; then
                     read -r EVIDENCE_CONSISTENCY_RESULT EVIDENCE_CONSISTENCY_REASON <<< "$EVIDENCE_INFO"
@@ -320,7 +324,49 @@ for STAGE in GENERAL TRUSTED_SOURCES CATEGORY_EXPANSION; do
                     FAILURE_REASON="${EVIDENCE_CONSISTENCY_REASON:-top3_evidence_inconsistent}"
                     GATE_RESULT="FAIL"
                 fi
-                if [[ "$EVIDENCE_CONSISTENCY_RESULT" == "PASS" ]]; then
+                ARTICLE_CHECK_INFO="NOT_RUN"
+                if [[ "$GATE_RESULT" == "PASS" ]]; then
+                    ARTICLE_CHECK_INFO="$("$PYTHON_BIN" -B "$ARTICLE_COMPLETENESS" check "$VALIDATED_JSON" "$GATE_OUTPUT" 2>&1)" || true
+                fi
+                if [[ "$GATE_RESULT" == "PASS" && "$ARTICLE_CHECK_INFO" == "ARTICLE_COMPLETENESS_INVALID" ]]; then
+                    ARTICLE_COMPLETENESS_REPAIR_ATTEMPTED=true
+                    ARTICLE_COMPLETENESS_REPAIR_RESULT=FAIL
+                    ARTICLE_REPAIRED_JSON="$WORK_DIR/article-completeness-repaired-${ATTEMPT}.json"
+                    ARTICLE_REPAIRED_BRIEF="$WORK_DIR/article-completeness-repaired-brief-${ATTEMPT}.md"
+                    ARTICLE_REPAIRED_CANDIDATES="$WORK_DIR/article-completeness-repaired-candidates-${ATTEMPT}.json"
+                    if "$PYTHON_BIN" -B "$ARTICLE_COMPLETENESS" repair "$VALIDATED_JSON" "$GATE_OUTPUT" \
+                        "$ARTICLE_REPAIRED_JSON" "$ARTICLE_REPAIRED_BRIEF" >/dev/null 2>&1; then
+                        ARTICLE_CONTRACT_INFO="$("$PYTHON_BIN" -B "$JSON_CONTRACT" validate "$ARTICLE_REPAIRED_JSON" \
+                            "$ARTICLE_REPAIRED_BRIEF" "$ARTICLE_REPAIRED_CANDIDATES" 2>&1)"
+                        read -r ARTICLE_CONTRACT_STATUS ARTICLE_CONTRACT_REASON <<< "$ARTICLE_CONTRACT_INFO"
+                        if [[ "$ARTICLE_CONTRACT_STATUS" == "PUBLISH" ]] && \
+                           [[ "$("$PYTHON_BIN" -B "$ARTICLE_COMPLETENESS" check "$ARTICLE_REPAIRED_JSON" "$ARTICLE_REPAIRED_BRIEF")" == "PASS" ]]; then
+                            ARTICLE_COMPLETENESS_REPAIR_RESULT=PASS
+                            VALIDATED_JSON="$ARTICLE_REPAIRED_JSON"
+                            CANDIDATE_OUTPUT="$ARTICLE_REPAIRED_CANDIDATES"
+                            cp "$ARTICLE_REPAIRED_BRIEF" "$GATE_OUTPUT" || fail "article_completeness_brief_copy_failed"
+                        else
+                            FAILURE_REASON="ARTICLE_COMPLETENESS_INVALID"
+                            GATE_RESULT="FAIL"
+                        fi
+                    else
+                        FAILURE_REASON="ARTICLE_COMPLETENESS_INVALID"
+                        GATE_RESULT="FAIL"
+                    fi
+                elif [[ "$GATE_RESULT" == "PASS" && "$ARTICLE_CHECK_INFO" != "PASS" ]]; then
+                    FAILURE_REASON="ARTICLE_COMPLETENESS_INVALID"
+                    GATE_RESULT="FAIL"
+                fi
+                if [[ "$GATE_RESULT" == "PASS" && "$ARTICLE_COMPLETENESS_REPAIR_RESULT" == "PASS" ]] && \
+                   ! EVIDENCE_INFO="$("$PYTHON_BIN" -B "$EVIDENCE_GATE" "$VALIDATED_JSON" \
+                    "$GATE_OUTPUT" "$EVIDENCE_OUTPUT" 2>&1)"; then
+                    read -r EVIDENCE_CONSISTENCY_RESULT EVIDENCE_CONSISTENCY_REASON <<< "$EVIDENCE_INFO"
+                    FAILURE_REASON="${EVIDENCE_CONSISTENCY_REASON:-top3_evidence_inconsistent}"
+                    GATE_RESULT="FAIL"
+                elif [[ "$GATE_RESULT" == "PASS" && "$ARTICLE_COMPLETENESS_REPAIR_RESULT" == "PASS" ]]; then
+                    read -r EVIDENCE_CONSISTENCY_RESULT EVIDENCE_CONSISTENCY_REASON <<< "$EVIDENCE_INFO"
+                fi
+                if [[ "$GATE_RESULT" == "PASS" && "$EVIDENCE_CONSISTENCY_RESULT" == "PASS" ]]; then
                     FAILURE_REASON="$(validate_brief "$GATE_OUTPUT")"
                     QUALITY_GATE_RAN=true
                     if [[ "$FAILURE_REASON" == "pass" ]]; then
