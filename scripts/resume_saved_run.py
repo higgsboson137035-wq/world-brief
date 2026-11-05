@@ -26,11 +26,13 @@ try:
     from .review_draft_gate import validate_text
     from .top3_evidence_gate import validate_consistency
     from .article_completeness_repair import repair_envelope, validate_completeness
+    from .top3_summary_binding_repair import repair_summary_binding
 except ImportError:  # Executed as a standalone script.
     from json_contract import ContractError, parse_json, validate_envelope
     from review_draft_gate import validate_text
     from top3_evidence_gate import validate_consistency
     from article_completeness_repair import repair_envelope, validate_completeness
+    from top3_summary_binding_repair import repair_summary_binding
 
 
 RUN_ID_RE = re.compile(r"^run-\d{2}$")
@@ -246,9 +248,23 @@ def prepare_resume(root: Path, run_date: str, run_id: str, *, output_dir: Path |
     if final_status != "PUBLISH":
         raise ResumeFailure("saved_payload_not_publish")
 
+    summary_binding_repaired = False
     evidence = validate_consistency(envelope, body)
     if evidence.get("evidence_consistency_result") != "PASS":
-        raise ResumeFailure(f"evidence_consistency_failed:{evidence.get('evidence_consistency_reason')}")
+        repaired_summary = repair_summary_binding(envelope, body)
+        if repaired_summary is None:
+            raise ResumeFailure(f"evidence_consistency_failed:{evidence.get('evidence_consistency_reason')}")
+        envelope, body = repaired_summary
+        summary_binding_repaired = True
+        try:
+            repaired_status, repaired_body, _ = validate_envelope(envelope)
+        except (ContractError, ValueError) as exc:
+            raise ResumeFailure(f"json_contract_failed:{exc}") from exc
+        if repaired_status != "PUBLISH" or repaired_body != body:
+            raise ResumeFailure("top3_summary_binding_repair_validation_failed")
+        evidence = validate_consistency(envelope, body)
+        if evidence.get("evidence_consistency_result") != "PASS":
+            raise ResumeFailure(f"evidence_consistency_failed:{evidence.get('evidence_consistency_reason')}")
 
     completeness_repaired = False
     if validate_completeness(envelope, body) != "PASS":
@@ -257,7 +273,12 @@ def prepare_resume(root: Path, run_date: str, run_id: str, *, output_dir: Path |
             raise ResumeFailure("article_completeness_repair_failed")
         envelope, body = repaired
         completeness_repaired = True
-        if validate_envelope(envelope)[0] != "PUBLISH" or validate_completeness(envelope, body) != "PASS":
+        try:
+            repaired_status, repaired_body, _ = validate_envelope(envelope)
+        except (ContractError, ValueError) as exc:
+            raise ResumeFailure(f"json_contract_failed:{exc}") from exc
+        if (repaired_status != "PUBLISH" or repaired_body != body
+                or validate_completeness(envelope, body) != "PASS"):
             raise ResumeFailure("article_completeness_repair_validation_failed")
         evidence = validate_consistency(envelope, body)
     if evidence.get("evidence_consistency_result") != "PASS":
@@ -288,7 +309,9 @@ def prepare_resume(root: Path, run_date: str, run_id: str, *, output_dir: Path |
         "source_json": payload_path.name,
         "source_json_sha256": hashlib.sha256(payload_path.read_bytes()).hexdigest(),
         "resume_json_contract": "PASS",
+        "resume_top3_summary_binding_repair": "PASS" if summary_binding_repaired else "NOT_NEEDED",
         "resume_article_completeness_repair": "PASS" if completeness_repaired else "NOT_NEEDED",
+        "resume_article_completeness": "PASS",
         "resume_evidence_consistency": evidence.get("evidence_consistency_result"),
         "resume_evidence_consistency_reason": evidence.get("evidence_consistency_reason"),
         "resume_quality_gate": quality,

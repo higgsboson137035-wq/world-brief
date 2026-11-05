@@ -135,7 +135,9 @@ def repair_envelope(envelope: dict, brief: str) -> tuple[dict, str] | None:
     repaired = "\n".join(lines).rstrip() + "\n"
     if validate_completeness(envelope, repaired) != PASS:
         return None
-    return envelope, repaired
+    repaired_envelope = dict(envelope)
+    repaired_envelope["brief_markdown"] = repaired
+    return repaired_envelope, repaired
 
 
 def main(argv: list[str] | None = None) -> int:
