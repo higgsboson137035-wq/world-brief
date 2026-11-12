@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import shutil
@@ -171,6 +172,26 @@ class AutoPublishTests(unittest.TestCase):
         output = self._git("show", "--format=", "--name-only", "HEAD")
         return {line for line in output.splitlines() if line}
 
+    def _isolated_candidates(self):
+        stage = self.root / "drafts" / "stage-fixture"
+        stage.mkdir(exist_ok=True)
+        candidates, _ = publisher.make_candidates(self.root, RUN_DATE, stage)
+        index = stage / "isolated-index"
+        publisher.add_candidates_binary(self.root, index, candidates)
+        return index
+
+    def _cached_diagnostic(self):
+        path = self.root / "logs/runs" / RUN_DATE / "publisher-cached-diff-diagnostic.json"
+        self.assertTrue(path.is_file())
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def _serialized_public_markdown(self, body):
+        self._replace_draft(body)
+        stage = self.root / "drafts" / "serializer-fixture"
+        stage.mkdir(exist_ok=True)
+        candidates, _ = publisher.make_candidates(self.root, RUN_DATE, stage)
+        return candidates[f"briefs/{RUN_DATE}.md"]
+
     def _snapshot(self, paths):
         return {path: (self.root / path).read_bytes() for path in paths}
 
@@ -314,6 +335,95 @@ class AutoPublishTests(unittest.TestCase):
         self.assertEqual(self._git("rev-parse", "HEAD"), base)
         self.assertEqual(target_before, self._snapshot(("latest.html", "index.html", "archive.html", "2026-10-04.html")))
         self.assertFalse((self.root / "unexpected.txt").exists())
+
+    def test_cached_diff_diagnostic_records_normal_isolated_index_pass(self):
+        main_index_before = self._git("diff", "--cached", "--name-only")
+        index = self._isolated_candidates()
+        publisher.validate_stage(self.root, index, RUN_DATE, publisher.format_paths(RUN_DATE))
+        diagnostic = self._cached_diagnostic()
+        self.assertEqual(diagnostic["failure_reason"], None)
+        self.assertTrue(diagnostic["isolated_index"])
+        self.assertEqual(diagnostic["expected_publication_paths"], list(publisher.format_paths(RUN_DATE)))
+        self.assertCountEqual(diagnostic["actual_cached_paths"], publisher.format_paths(RUN_DATE))
+        self.assertEqual(diagnostic["cached_diff_check"]["exit_code"], 0)
+        self.assertEqual(len(diagnostic["cached_numstat"]["stdout"].splitlines()), 5)
+        self.assertEqual(self._git("diff", "--cached", "--name-only"), main_index_before)
+
+    def test_public_markdown_eof_serializer_keeps_one_existing_final_newline(self):
+        body = fixture_markdown()
+        self.assertTrue(body.endswith("\n"))
+        self.assertEqual(self._serialized_public_markdown(body), body.encode("utf-8"))
+
+    def test_public_markdown_eof_serializer_removes_one_trailing_blank_line(self):
+        body = fixture_markdown() + "\n"
+        self.assertEqual(self._serialized_public_markdown(body), fixture_markdown().encode("utf-8"))
+
+    def test_public_markdown_eof_serializer_removes_multiple_trailing_blank_lines(self):
+        body = fixture_markdown() + "\n\n\n"
+        self.assertEqual(self._serialized_public_markdown(body), fixture_markdown().encode("utf-8"))
+
+    def test_public_markdown_eof_serializer_preserves_internal_blank_lines(self):
+        body = fixture_markdown()
+        self.assertIn("\n\n", body)
+        self.assertEqual(self._serialized_public_markdown(body), body.encode("utf-8"))
+
+    def test_public_markdown_eof_serializer_preserves_nonterminal_trailing_spaces(self):
+        body = fixture_markdown()
+        without_final_lf = body[:-1]
+        body_with_terminal_hardbreak = without_final_lf + "  \n\n"
+        serialized = self._serialized_public_markdown(body_with_terminal_hardbreak)
+        self.assertEqual(serialized, (without_final_lf + "  \n").encode("utf-8"))
+        self.assertTrue(serialized.endswith(b"  \n"))
+
+    def test_cached_diff_check_failure_preserves_output_and_reason(self):
+        self._replace_draft(fixture_markdown().replace("Summary.\n", "Summary. \n", 1))
+        index = self._isolated_candidates()
+        with self.assertRaises(PublishFailure) as raised:
+            publisher.validate_stage(self.root, index, RUN_DATE, publisher.format_paths(RUN_DATE))
+        self.assertEqual(raised.exception.code, "cached_diff_check_failed")
+        diagnostic = self._cached_diagnostic()
+        self.assertEqual(diagnostic["failure_reason"], "cached_diff_check_failed")
+        check = diagnostic["cached_diff_check"]
+        self.assertIn("trailing whitespace", check["stdout"] + check["stderr"])
+        self.assertEqual(check["exit_code"], 2)
+        self.assertIn("cached_numstat", diagnostic)
+
+    def test_unexpected_cached_path_saves_diagnostic_and_preserves_reason(self):
+        index = self._isolated_candidates()
+        env = dict(self.env)
+        env["GIT_INDEX_FILE"] = str(index)
+        blob = subprocess.run(
+            ["git", "hash-object", "-w", "--stdin"], cwd=self.root, env=env,
+            input=b"unexpected", stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+        ).stdout.decode().strip()
+        subprocess.run(
+            ["git", "update-index", "--add", "--cacheinfo", f"100644,{blob},unexpected.txt"],
+            cwd=self.root, env=env, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        with self.assertRaises(PublishFailure) as raised:
+            publisher.validate_stage(self.root, index, RUN_DATE, publisher.format_paths(RUN_DATE))
+        self.assertEqual(raised.exception.code, "staged_path_set_invalid")
+        diagnostic = self._cached_diagnostic()
+        self.assertEqual(diagnostic["failure_reason"], "staged_path_set_invalid")
+        self.assertIn("unexpected.txt", diagnostic["actual_cached_paths"])
+        self.assertIn("cached_numstat", diagnostic)
+
+    def test_numstat_failure_saves_diagnostic_and_preserves_reason(self):
+        index = self._isolated_candidates()
+        original = publisher.git
+
+        def bad_numstat(root, *args, **kwargs):
+            if "--numstat" in args:
+                return subprocess.CompletedProcess(["git", *args], 0, "1\t1\twrong.md\n", "")
+            return original(root, *args, **kwargs)
+
+        with patch.object(publisher, "git", side_effect=bad_numstat):
+            with self.assertRaises(PublishFailure) as raised:
+                publisher.validate_stage(self.root, index, RUN_DATE, publisher.format_paths(RUN_DATE))
+        self.assertEqual(raised.exception.code, "cached_diff_stat_invalid")
+        diagnostic = self._cached_diagnostic()
+        self.assertEqual(diagnostic["failure_reason"], "cached_diff_stat_invalid")
+        self.assertIn("wrong.md", diagnostic["cached_numstat"]["stdout"])
 
     def test_push_failure_is_single_attempt_and_does_not_pull_or_force(self):
         hook = self.remote / "hooks/pre-receive"

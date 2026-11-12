@@ -6,6 +6,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from html.parser import HTMLParser
 import html
+import json
 import os
 from pathlib import Path
 import re
@@ -94,6 +95,11 @@ def exact_notice_removal(raw: bytes) -> bytes:
     if any(token in body for token in (NOTICE_MD[0], "Human確認前・未公開", "Human未確認")):
         raise PublishFailure("review_notice_in_body")
     return body.encode("utf-8")
+
+
+def normalize_public_markdown_eof(body: bytes) -> bytes:
+    """Remove terminal line breaks only, then serialize one final LF."""
+    return body.rstrip(b"\r\n") + b"\n"
 
 
 class PublicMarkdownSanitizer(HTMLParser):
@@ -204,6 +210,7 @@ def make_candidates(root: Path, run_date: str, stage: Path) -> tuple[dict[str, b
         raise PublishFailure("draft_invalid_utf8") from exc
     if validate_text(body_text, run_date) != "pass":
         raise PublishFailure("quality_gate_failed")
+    public_markdown_bytes = normalize_public_markdown_eof(body_bytes)
 
     urls = {
         match.group(1)
@@ -230,7 +237,7 @@ def make_candidates(root: Path, run_date: str, stage: Path) -> tuple[dict[str, b
 
     public_page = render_page(f"World Brief - {run_date}", "".join(sanitizer.output))
     staged_md = stage / f"{run_date}.md"
-    staged_md.write_bytes(body_bytes)
+    staged_md.write_bytes(public_markdown_bytes)
     md_mtime = datetime.fromtimestamp(staged_md.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
 
     md_output = f"briefs/{run_date}.md"
@@ -280,7 +287,7 @@ def make_candidates(root: Path, run_date: str, stage: Path) -> tuple[dict[str, b
     archive_page = render_page("World Brief Archive", archive_body)
 
     candidates = {
-        md_output: body_bytes,
+        md_output: public_markdown_bytes,
         date_output: public_page.encode("utf-8"),
         latest_output: public_page.encode("utf-8"),
         index_output: index_page.encode("utf-8"),
@@ -346,37 +353,112 @@ def preflight(root: Path, run_date: str, paths: tuple[str, ...]) -> str:
 
 
 def validate_stage(root: Path, index: Path, run_date: str, paths: tuple[str, ...]) -> None:
-    names = require_git(root, "diff", "--cached", "--name-only", index=index).splitlines()
+    diagnostic: dict[str, object] = {
+        "schema_version": 1,
+        "run_date": run_date,
+        "run_id": os.environ.get("WORLD_BRIEF_RUN_ID", "run-01"),
+        "isolated_index": True,
+        "index_basename": index.name,
+        "expected_publication_paths": list(paths),
+    }
+
+    def capture_missing() -> None:
+        """Collect remaining read-only index details after a validation failure."""
+        commands = (
+            ("cached_paths", ("diff", "--cached", "--name-only")),
+            ("cached_name_status", ("diff", "--cached", "--name-status")),
+            ("cached_numstat", ("diff", "--cached", "--numstat")),
+            ("cached_diff_check", ("diff", "--cached", "--check")),
+        )
+        for key, args in commands:
+            if key in diagnostic:
+                continue
+            result = git(root, *args, index=index)
+            diagnostic[key] = {
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "exit_code": result.returncode,
+            }
+        path_result = diagnostic.get("cached_paths", {})
+        if isinstance(path_result, dict):
+            diagnostic["actual_cached_paths"] = path_result.get("stdout", "").splitlines()
+
+    def save(reason: str | None) -> None:
+        diagnostic["failure_reason"] = reason
+        try:
+            run_id = str(diagnostic["run_id"])
+            if run_id not in {"run-01", "run-02"}:
+                run_id = "run-01"
+            run_component = run_id if run_id != "run-01" else None
+            artifact_dir = root / "logs" / "runs" / run_date
+            if run_component:
+                artifact_dir /= run_component
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            artifact = artifact_dir / "publisher-cached-diff-diagnostic.json"
+            temp_artifact = artifact.with_name(f".{artifact.name}.tmp")
+            temp_artifact.write_text(json.dumps(diagnostic, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            os.replace(temp_artifact, artifact)
+        except (OSError, ValueError, TypeError):
+            # Diagnostics must not replace or mask the existing publisher result.
+            pass
+
+    names_result = git(root, "diff", "--cached", "--name-only", index=index)
+    if names_result.returncode != 0:
+        raise PublishFailure("git_preflight_failed")
+    names = names_result.stdout.splitlines()
+    diagnostic["cached_paths"] = {"stdout": names_result.stdout, "stderr": names_result.stderr, "exit_code": names_result.returncode}
+    diagnostic["actual_cached_paths"] = names
     if set(names) != set(paths) or len(names) != 5:
+        capture_missing()
+        save("staged_path_set_invalid")
         raise PublishFailure("staged_path_set_invalid")
-    status_lines = require_git(root, "diff", "--cached", "--name-status", index=index).splitlines()
+    status_result = git(root, "diff", "--cached", "--name-status", index=index)
+    if status_result.returncode != 0:
+        raise PublishFailure("git_preflight_failed")
+    status_lines = status_result.stdout.splitlines()
+    diagnostic["cached_name_status"] = {"stdout": status_result.stdout, "stderr": status_result.stderr, "exit_code": status_result.returncode}
     statuses = {}
     for line in status_lines:
         parts = line.split("\t")
         if len(parts) != 2:
+            capture_missing()
+            save("staged_status_invalid")
             raise PublishFailure("staged_status_invalid")
         statuses[parts[1]] = parts[0]
     expected = {key.format(date=run_date): value for key, value in EXPECTED_STATUS.items()}
     if statuses != expected:
+        capture_missing()
+        save("staged_status_invalid")
         raise PublishFailure("staged_status_invalid")
 
     check = git(root, "diff", "--cached", "--check", index=index)
+    diagnostic["cached_diff_check"] = {"stdout": check.stdout, "stderr": check.stderr, "exit_code": check.returncode}
     check_text = check.stdout + check.stderr
     md_path = f"briefs/{run_date}.md"
     if check.returncode not in (0, 2) or not allow_only_markdown_hardbreak_warnings(check_text, md_path):
+        capture_missing()
+        save("cached_diff_check_failed")
         raise PublishFailure("cached_diff_check_failed")
 
-    numstat = require_git(root, "diff", "--cached", "--numstat", index=index).splitlines()
+    numstat_result = git(root, "diff", "--cached", "--numstat", index=index)
+    if numstat_result.returncode != 0:
+        raise PublishFailure("git_preflight_failed")
+    diagnostic["cached_numstat"] = {"stdout": numstat_result.stdout, "stderr": numstat_result.stderr, "exit_code": numstat_result.returncode}
+    numstat = numstat_result.stdout.splitlines()
     if len(numstat) != 5:
+        save("cached_diff_stat_invalid")
         raise PublishFailure("cached_diff_stat_invalid")
     stat_paths = set()
     for line in numstat:
         parts = line.split("\t")
         if len(parts) != 3 or parts[0] == "-" or parts[1] == "-":
+            save("cached_diff_stat_invalid")
             raise PublishFailure("cached_diff_stat_invalid")
         stat_paths.add(parts[2])
     if stat_paths != set(paths):
+        save("cached_diff_stat_invalid")
         raise PublishFailure("cached_diff_stat_invalid")
+    save(None)
 
 
 def add_candidates_binary(root: Path, index: Path, candidates: dict[str, bytes]) -> None:
