@@ -18,6 +18,7 @@ JSON_CONTRACT = ROOT / "scripts" / "json_contract.py"
 EVIDENCE_GATE = ROOT / "scripts" / "top3_evidence_gate.py"
 CANDIDATE_POOL = ROOT / "scripts" / "candidate_pool.py"
 ARTICLE_COMPLETENESS = ROOT / "scripts" / "article_completeness_repair.py"
+SUMMARY_BINDING_REPAIR = ROOT / "scripts" / "top3_summary_binding_repair.py"
 
 
 def make_brief(duplicate=False, missing_top3=False, japan_heading_only=False, japan_short=False, japan_shallow=False, extra_heading=False):
@@ -154,6 +155,7 @@ class GenerateReviewDraftTests(unittest.TestCase):
         shutil.copy2(EVIDENCE_GATE, self.root / "scripts" / EVIDENCE_GATE.name)
         shutil.copy2(CANDIDATE_POOL, self.root / "scripts" / CANDIDATE_POOL.name)
         shutil.copy2(ARTICLE_COMPLETENESS, self.root / "scripts" / ARTICLE_COMPLETENESS.name)
+        shutil.copy2(SUMMARY_BINDING_REPAIR, self.root / "scripts" / SUMMARY_BINDING_REPAIR.name)
         shutil.copy2(PROMPT, self.root / "prompts" / PROMPT.name)
         self.fake_bin = self.root / "fake-bin"
         self.fake_bin.mkdir()
@@ -315,6 +317,10 @@ class GenerateReviewDraftTests(unittest.TestCase):
         record = json.loads((run_dir / "diagnostic.json").read_text(encoding="utf-8"))
         self.assertFalse(record["format_repair_attempted"])
         self.assertFalse(record["contract_repair_attempted"])
+        self.assertTrue(record["summary_binding_checked"])
+        self.assertEqual(record["summary_binding_result"], "PASS")
+        self.assertFalse(record["summary_binding_repair_attempted"])
+        self.assertEqual(record["summary_binding_repair_result"], "NOT_ATTEMPTED")
         self.assertEqual(record["original_gate_result"], "PASS")
         self._assert_public_unchanged(before)
 
@@ -357,11 +363,11 @@ class GenerateReviewDraftTests(unittest.TestCase):
         before = self._snapshot_public()
         result = self._run("top3")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("top3_evidence_inconsistent", result.stderr)
+        self.assertIn("top3_summary_binding_repair_failed", result.stderr)
         record = json.loads((self.root / "logs/runs/2026-10-04/diagnostic.json").read_text(encoding="utf-8"))
         self.assertFalse(record["format_repair_attempted"])
-        self.assertEqual(record["evidence_consistency_result"], "FAIL")
-        self.assertEqual(record["evidence_consistency_reason"], "top3_evidence_inconsistent")
+        self.assertEqual(record["evidence_consistency_result"], "NOT_RUN")
+        self.assertEqual(record["summary_binding_result"], "FAIL")
         self.assertEqual(record["original_gate_result"], "NOT_RUN")
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
         self.assertEqual(len(self.calls.read_text(encoding="utf-8").splitlines()), 1)
@@ -627,17 +633,94 @@ class GenerateReviewDraftTests(unittest.TestCase):
         before = self._snapshot_public()
         result = self._run("custom")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("top3_source_title_mismatch", result.stderr)
+        self.assertIn("top3_summary_binding_repair_failed", result.stderr)
         record = json.loads((self.root / "logs/runs/2026-10-04/diagnostic.json").read_text(encoding="utf-8"))
-        self.assertEqual(record["evidence_consistency_result"], "FAIL")
-        self.assertEqual(record["evidence_consistency_reason"], "top3_source_title_mismatch")
-        self.assertTrue(any(item.get("candidate_title") == "Article 3"
-                            for item in record["evidence_consistency_details"]))
+        self.assertEqual(record["evidence_consistency_result"], "NOT_RUN")
+        self.assertEqual(record["summary_binding_result"], "FAIL")
         self.assertEqual(record["original_gate_result"], "NOT_RUN")
         self.assertFalse(record["format_repair_attempted"])
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())
         self.assertEqual(self.calls.read_text(encoding="utf-8").splitlines(), ["GENERAL"])
         self._assert_public_unchanged(before)
+
+    def test_summary_binding_repair_runs_before_evidence_gate_and_records_result(self):
+        payload = json.loads(response_json(make_brief()))
+        payload["top3"][0]["summary"] = "言い換えられた要約。"
+        payload["brief_markdown"] = payload["brief_markdown"].replace(
+            "1. First distinct event.", "1. 言い換えられた要約。"
+        )
+        self._set_response(json.dumps(payload, ensure_ascii=False))
+        result = self._run("custom")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run_dir = self.root / "logs/runs/2026-10-04"
+        record = json.loads((run_dir / "diagnostic.json").read_text(encoding="utf-8"))
+        gate = json.loads((run_dir / "attempt-1-gate.json").read_text(encoding="utf-8"))
+        self.assertTrue(record["summary_binding_checked"])
+        self.assertEqual(record["summary_binding_result"], "PASS")
+        self.assertTrue(record["summary_binding_repair_attempted"])
+        self.assertEqual(record["summary_binding_repair_result"], "PASS")
+        self.assertEqual(record["evidence_consistency_result"], "PASS")
+        self.assertEqual(gate["summary_binding_repair_result"], "PASS")
+        self.assertEqual(self.calls.read_text(encoding="utf-8").splitlines(), ["GENERAL"])
+
+    def _set_summary_mismatch(self):
+        payload = json.loads(response_json(make_brief()))
+        payload["top3"][0]["summary"] = "rewritten summary"
+        payload["brief_markdown"] = payload["brief_markdown"].replace(
+            "1. First distinct event.", "1. rewritten summary"
+        )
+        self._set_response(json.dumps(payload, ensure_ascii=False))
+
+    def test_summary_binding_repair_contract_recheck_failure_stops(self):
+        self._set_summary_mismatch()
+        contract = self.root / "scripts/json_contract.py"
+        real = self.root / "scripts/json_contract_real.py"
+        contract.rename(real)
+        self._write_executable(contract, "#!/usr/bin/env python3\nimport pathlib, runpy, sys\n"
+            f"real = pathlib.Path({str(real)!r})\n"
+            "if sys.argv[1] == 'validate' and 'summary-binding-repaired' in sys.argv[2]:\n"
+            " print('INVALID forced_recheck_failure'); raise SystemExit(0)\n"
+            "sys.path.insert(0, str(real.parent)); runpy.run_path(str(real), run_name='__main__')\n")
+        result = self._run("custom")
+        self.assertNotEqual(result.returncode, 0)
+        record = json.loads((self.root / "logs/runs/2026-10-04/diagnostic.json").read_text(encoding="utf-8"))
+        self.assertTrue(record["summary_binding_repair_attempted"])
+        self.assertEqual(record["summary_binding_repair_result"], "FAIL")
+        self.assertEqual(record["evidence_consistency_result"], "NOT_RUN")
+
+    def test_summary_binding_repair_binding_recheck_failure_stops(self):
+        self._set_summary_mismatch()
+        helper = self.root / "scripts/top3_summary_binding_repair.py"
+        with helper.open("a", encoding="utf-8") as stream:
+            stream.write("\n_real_repair_summary_binding = repair_summary_binding\n"
+                         "def repair_summary_binding(envelope, brief):\n"
+                         "    result = _real_repair_summary_binding(envelope, brief)\n"
+                         "    if result is None: return None\n"
+                         "    fixed, body = result\n"
+                         "    fixed['top3'][0]['summary'] = 'still mismatched'\n"
+                         "    target = next(c['verified_summary'] for c in fixed['candidate_diagnostics']['candidates'] if c['candidate_id'] == fixed['top3'][0]['candidate_id'])\n"
+                         "    body = body.replace('1. ' + target, '1. still mismatched', 1)\n"
+                         "    fixed['brief_markdown'] = body\n"
+                         "    return fixed, body\n")
+        result = self._run("custom")
+        self.assertNotEqual(result.returncode, 0)
+        record = json.loads((self.root / "logs/runs/2026-10-04/diagnostic.json").read_text(encoding="utf-8"))
+        self.assertIn("top3_summary_binding_repair_validation_failed", result.stderr)
+        self.assertEqual(record["evidence_consistency_result"], "NOT_RUN")
+
+    def test_evidence_failure_after_binding_repair_stops_before_quality_gate(self):
+        self._set_summary_mismatch()
+        gate = self.root / "scripts/top3_evidence_gate.py"
+        self._write_executable(gate, "#!/usr/bin/env python3\nimport json, pathlib, sys\n"
+            "pathlib.Path(sys.argv[3]).write_text(json.dumps({'evidence_consistency_result':'FAIL','evidence_consistency_reason':'forced_evidence_failure','top3_candidate_ids':['C1','C2','C3'],'selected_candidate_ids':['C1','C2','C3'],'evidence_consistency_details':[]}))\n"
+            "print('FAIL forced_evidence_failure'); raise SystemExit(1)\n")
+        result = self._run("custom")
+        self.assertNotEqual(result.returncode, 0)
+        record = json.loads((self.root / "logs/runs/2026-10-04/diagnostic.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["summary_binding_result"], "PASS")
+        self.assertEqual(record["summary_binding_repair_result"], "PASS")
+        self.assertEqual(record["evidence_consistency_result"], "FAIL")
+        self.assertFalse(record["draft_saved"])
 
     def test_failed_contract_repair_stops_before_quality_gate(self):
         body = make_brief() + "\n## Candidate Diagnostics\n\n| candidate_id | title |\n|---|---|\n| C1 | Article 1 |\n"

@@ -11,7 +11,7 @@ from scripts.json_contract import validate_envelope
 from scripts.review_draft_gate import validate_text
 from scripts.resume_saved_run import prepare_resume
 from scripts.top3_evidence_gate import validate_consistency
-from scripts.top3_summary_binding_repair import repair_summary_binding
+from scripts.top3_summary_binding_repair import check_summary_binding, repair_summary_binding
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,6 +50,32 @@ class Top3SummaryBindingRepairTests(unittest.TestCase):
                              if c["candidate_id"] == item["candidate_id"])
             self.assertEqual(item["summary"], candidate["verified_summary"])
             self.assertEqual(rendered[index], candidate["verified_summary"])
+
+    def test_b1_structured_summary_only_mismatch_is_repaired(self):
+        envelope, body = fixture()
+        envelope, body = repair_summary_binding(envelope, body)
+        envelope["top3"][0]["summary"] = "different structured wording"
+        repaired, repaired_body = repair_summary_binding(envelope, body)
+        self.assertEqual(repaired["top3"][0]["summary"], repaired["candidate_diagnostics"]["candidates"][0]["verified_summary"])
+        self.assertEqual(check_summary_binding(repaired, repaired_body), "PASS")
+        self.assertEqual(validate_consistency(repaired, repaired_body)["evidence_consistency_result"], "PASS")
+
+    def test_b2_brief_summary_only_mismatch_is_repaired(self):
+        envelope, body = fixture()
+        envelope, body = repair_summary_binding(envelope, body)
+        envelope["brief_markdown"] = body
+        mismatched = body.replace("1. " + envelope["top3"][0]["summary"], "1. brief only mismatch", 1)
+        repaired, repaired_body = repair_summary_binding(envelope, mismatched)
+        self.assertEqual(repaired["top3"][0]["summary"], envelope["top3"][0]["summary"])
+        self.assertEqual(check_summary_binding(repaired, repaired_body), "PASS")
+
+    def test_b3_structured_and_brief_mismatches_are_repaired_once(self):
+        envelope, body = fixture()
+        envelope["top3"][0]["summary"] = "structured mismatch"
+        body = body.replace("1. " + envelope["top3"][0]["summary"], "1. brief mismatch", 1)
+        repaired, repaired_body = repair_summary_binding(envelope, body)
+        self.assertIsNone(repair_summary_binding(repaired, repaired_body))
+        self.assertEqual(check_summary_binding(repaired, repaired_body), "PASS")
 
     def test_c_repair_changes_only_structured_and_rendered_summaries(self):
         envelope, body = fixture()
@@ -114,6 +140,37 @@ class Top3SummaryBindingRepairTests(unittest.TestCase):
             self.assertEqual(result["resume_quality_gate"], "pass")
             self.assertTrue(Path(result["draft_markdown"]).is_file())
             self.assertTrue((target / "resume-publication.json").is_file())
+
+    def test_i_2026_11_18_saved_run_fixture_repairs_offline_through_quality_gate(self):
+        run = ROOT / "logs/runs/2026-11-18"
+        envelope = json.loads((run / "attempt-1-original-json-output.json").read_text(encoding="utf-8"))
+        status, body, _ = validate_envelope(envelope)
+        self.assertEqual(status, "PUBLISH")
+        self.assertEqual(validate_consistency(envelope, body)["evidence_consistency_result"], "FAIL")
+        before_candidates = copy.deepcopy(envelope["candidate_diagnostics"])
+        before_items = copy.deepcopy(envelope["top3"])
+
+        repaired = repair_summary_binding(envelope, body)
+        self.assertIsNotNone(repaired)
+        fixed, fixed_body = repaired
+        self.assertEqual(validate_envelope(fixed)[0], "PUBLISH")
+        self.assertEqual(check_summary_binding(fixed, fixed_body), "PASS")
+        self.assertEqual(validate_consistency(fixed, fixed_body)["evidence_consistency_result"], "PASS")
+        self.assertEqual(fixed["candidate_diagnostics"], before_candidates)
+        self.assertEqual([x["candidate_id"] for x in fixed["top3"]], [x["candidate_id"] for x in before_items])
+        for old, new in zip(before_items, fixed["top3"]):
+            self.assertEqual({k: v for k, v in old.items() if k != "summary"},
+                             {k: v for k, v in new.items() if k != "summary"})
+        for item in fixed["top3"]:
+            candidate = next(c for c in fixed["candidate_diagnostics"]["candidates"]
+                             if c["candidate_id"] == item["candidate_id"])
+            self.assertEqual(item["summary"], candidate["verified_summary"])
+
+        if validate_completeness(fixed, fixed_body) != COMPLETENESS_PASS:
+            fixed, fixed_body = self._repair_completeness(fixed, fixed_body)
+        self.assertEqual(validate_completeness(fixed, fixed_body), COMPLETENESS_PASS)
+        self.assertEqual(validate_consistency(fixed, fixed_body)["evidence_consistency_result"], "PASS")
+        self.assertEqual(validate_text(fixed_body, "2026-11-18"), "pass")
 
 
 if __name__ == "__main__":

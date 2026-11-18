@@ -214,6 +214,10 @@ def start_run(
         "evidence_consistency_result": "NOT_RUN",
         "evidence_consistency_reason": "NOT_RUN",
         "evidence_consistency_details": [],
+        "summary_binding_checked": False,
+        "summary_binding_result": "NOT_RUN",
+        "summary_binding_repair_attempted": False,
+        "summary_binding_repair_result": "NOT_ATTEMPTED",
         "search_stage": None,
         "search_strategy": None,
         "query_family": None,
@@ -255,6 +259,7 @@ def record_attempt(
     candidate_pool_metadata: Path | None = None,
     selection_repair_output: Path | None = None,
     selection_repair_metadata: dict | None = None,
+    summary_binding_metadata: dict | None = None,
 ) -> None:
     value = load_record(run_date, run_id)
     directory = run_dir(run_date, run_id)
@@ -360,6 +365,14 @@ def record_attempt(
         "selection_repair_result": "NOT_ATTEMPTED",
         "selection_repair_reason": "NOT_ATTEMPTED",
     }
+    summary_binding = {
+        "summary_binding_checked": False,
+        "summary_binding_result": "NOT_RUN",
+        "summary_binding_repair_attempted": False,
+        "summary_binding_repair_result": "NOT_ATTEMPTED",
+    }
+    if summary_binding_metadata:
+        summary_binding.update(summary_binding_metadata)
     gate = {
         "attempt": number,
         "search_stage": search_stage,
@@ -384,6 +397,7 @@ def record_attempt(
         )},
         "selection_repair_output": selection_output_target.name if selection_output_target.exists() else None,
         **selection_metadata,
+        **summary_binding,
     }
     atomic_json(gate_target, gate)
     attempts = [item for item in value.get("attempts", []) if item.get("attempt") != number]
@@ -394,6 +408,7 @@ def record_attempt(
         "gate_record": gate_target.name,
         "candidate_diagnostics": candidate_target.name,
         **repair,
+        **summary_binding,
     })
     attempts.sort(key=lambda item: item["attempt"])
     value["attempts"] = attempts
@@ -427,6 +442,7 @@ def record_attempt(
     for key, default in (("selection_inconsistent", False), ("selection_repair_attempted", False),
                          ("selection_repair_result", "NOT_ATTEMPTED"), ("selection_repair_reason", "NOT_ATTEMPTED")):
         value[key] = selection_metadata.get(key, default)
+    value.update(summary_binding)
     for key in (
         "json_contract_result", "json_contract_reason", "contract_repair_attempted",
         "contract_repair_result", "contract_repair_reason", "original_json_output",
@@ -617,6 +633,10 @@ def main() -> int:
     attempt.add_argument("--selection-repair-attempted", choices=("true", "false"), default="false")
     attempt.add_argument("--selection-repair-result", default="NOT_ATTEMPTED")
     attempt.add_argument("--selection-repair-reason", default="NOT_ATTEMPTED")
+    attempt.add_argument("--summary-binding-checked", choices=("true", "false"), default="false")
+    attempt.add_argument("--summary-binding-result", default="NOT_RUN")
+    attempt.add_argument("--summary-binding-repair-attempted", choices=("true", "false"), default="false")
+    attempt.add_argument("--summary-binding-repair-result", default="NOT_ATTEMPTED")
     extract = sub.add_parser("extract")
     extract.add_argument("raw_output", type=Path)
     extract.add_argument("brief_output", type=Path)
@@ -681,6 +701,11 @@ def main() -> int:
                                "selection_repair_attempted": args.selection_repair_attempted == "true",
                                "selection_repair_result": args.selection_repair_result,
                                "selection_repair_reason": args.selection_repair_reason,
+                           }, {
+                               "summary_binding_checked": args.summary_binding_checked == "true",
+                               "summary_binding_result": args.summary_binding_result,
+                               "summary_binding_repair_attempted": args.summary_binding_repair_attempted == "true",
+                               "summary_binding_repair_result": args.summary_binding_repair_result,
                            })
         elif args.command == "extract":
             status, diag = extract_response(args.raw_output, args.brief_output, args.candidate_output)

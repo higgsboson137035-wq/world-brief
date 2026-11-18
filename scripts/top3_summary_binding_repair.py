@@ -13,6 +13,52 @@ TOP3_HEADING = "## Today's Top 3"
 NUMBERED_SUMMARY = re.compile(r"^([1-3]\. )(.*)$")
 
 
+def check_summary_binding(envelope: dict, brief: str) -> str:
+    """Return PASS only when structured and rendered summaries exactly bind."""
+    items = envelope.get("top3")
+    block = envelope.get("candidate_diagnostics")
+    candidates = block.get("candidates") if isinstance(block, dict) else None
+    if not isinstance(items, list) or len(items) != 3 or not isinstance(candidates, list):
+        return "FAIL"
+    by_id: dict[str, dict] = {}
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            return "FAIL"
+        cid = candidate.get("candidate_id")
+        if not isinstance(cid, str) or cid in by_id:
+            return "FAIL"
+        by_id[cid] = candidate
+    lines = brief.splitlines()
+    try:
+        start = lines.index(TOP3_HEADING) + 1
+    except ValueError:
+        return "FAIL"
+    end = next((i for i in range(start, len(lines)) if lines[i].startswith("## ")), len(lines))
+    numbered = [NUMBERED_SUMMARY.fullmatch(lines[i]) for i in range(start, end)
+                if NUMBERED_SUMMARY.fullmatch(lines[i])]
+    if len(numbered) != 3 or [match.group(1) for match in numbered] != ["1. ", "2. ", "3. "]:
+        return "FAIL"
+    for item, match in zip(items, numbered):
+        candidate = by_id.get(item.get("candidate_id")) if isinstance(item, dict) else None
+        if not isinstance(candidate, dict):
+            return "FAIL"
+        if (candidate.get("selected_for_top3") is not True or candidate.get("duplicate") is not False
+                or candidate.get("rejection_reason") is not None or candidate.get("within_24h") is not True
+                or candidate.get("source_verified") is not True):
+            return "FAIL"
+        verified = candidate.get("verified_summary")
+        if not isinstance(verified, str) or not verified.strip():
+            return "FAIL"
+        if item.get("summary") != verified or match.group(2) != verified:
+            return "FAIL"
+        if (item.get("headline") != candidate.get("title")
+                or item.get("source_title") != candidate.get("title")
+                or item.get("source") != candidate.get("source")
+                or item.get("source_url") != candidate.get("url")):
+            return "FAIL"
+    return PASS
+
+
 def repair_summary_binding(envelope: dict, brief: str) -> tuple[dict, str] | None:
     """Return a copy with only structured/body Top 3 summaries rebound.
 

@@ -177,6 +177,10 @@ for STAGE in GENERAL TRUSTED_SOURCES CATEGORY_EXPANSION; do
     CONTRACT_REPAIR_REASON=NOT_ATTEMPTED
     EVIDENCE_CONSISTENCY_RESULT=NOT_RUN
     EVIDENCE_CONSISTENCY_REASON=NOT_RUN
+    SUMMARY_BINDING_CHECKED=false
+    SUMMARY_BINDING_RESULT=NOT_RUN
+    SUMMARY_BINDING_REPAIR_ATTEMPTED=false
+    SUMMARY_BINDING_REPAIR_RESULT=NOT_ATTEMPTED
     QUALITY_GATE_RAN=false
     VALIDATED_JSON="$RAW_OUTPUT"
     if run_codex "$RENDERED_PROMPT"; then
@@ -316,10 +320,67 @@ for STAGE in GENERAL TRUSTED_SOURCES CATEGORY_EXPANSION; do
                 GATE_RESULT="RETRY"
             elif [[ "$JSON_CONTRACT_RESULT" == "PASS" && "$RESPONSE_STATUS" == "PUBLISH" ]]; then
                 GATE_RESULT="PASS"
-                if EVIDENCE_INFO="$("$PYTHON_BIN" -B "$EVIDENCE_GATE" "$VALIDATED_JSON" \
+                SUMMARY_BINDING_CHECKED=true
+                SUMMARY_BINDING_RESULT="$(PYTHONPATH="$ROOT/scripts${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" -B - "$VALIDATED_JSON" "$GATE_OUTPUT" <<'PY'
+import json, sys
+from pathlib import Path
+from top3_summary_binding_repair import check_summary_binding
+print(check_summary_binding(json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")), Path(sys.argv[2]).read_text(encoding="utf-8")))
+PY
+                )" || SUMMARY_BINDING_RESULT=FAIL
+                if [[ "$SUMMARY_BINDING_RESULT" != PASS ]]; then
+                    SUMMARY_BINDING_REPAIR_ATTEMPTED=true
+                    SUMMARY_BINDING_REPAIR_RESULT=FAIL
+                    SUMMARY_REPAIRED_JSON="$WORK_DIR/summary-binding-repaired-${ATTEMPT}.json"
+                    SUMMARY_REPAIRED_BRIEF="$WORK_DIR/summary-binding-repaired-brief-${ATTEMPT}.md"
+                    SUMMARY_REPAIRED_CANDIDATES="$WORK_DIR/summary-binding-candidates-${ATTEMPT}.json"
+                    if PYTHONPATH="$ROOT/scripts${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" -B - "$VALIDATED_JSON" "$GATE_OUTPUT" "$SUMMARY_REPAIRED_JSON" "$SUMMARY_REPAIRED_BRIEF" <<'PY'
+import json, sys
+from pathlib import Path
+from top3_summary_binding_repair import repair_summary_binding
+repaired = repair_summary_binding(json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")), Path(sys.argv[2]).read_text(encoding="utf-8"))
+if repaired is None:
+    raise SystemExit(1)
+envelope, body = repaired
+Path(sys.argv[3]).write_text(json.dumps(envelope, ensure_ascii=False) + "\n", encoding="utf-8")
+Path(sys.argv[4]).write_text(body, encoding="utf-8")
+PY
+                    then
+                        SUMMARY_CONTRACT_INFO="$("$PYTHON_BIN" -B "$JSON_CONTRACT" validate "$SUMMARY_REPAIRED_JSON" "$SUMMARY_REPAIRED_BRIEF" "$SUMMARY_REPAIRED_CANDIDATES" 2>&1)"
+                        read -r SUMMARY_CONTRACT_STATUS SUMMARY_CONTRACT_REASON <<< "$SUMMARY_CONTRACT_INFO"
+                        if [[ "$SUMMARY_CONTRACT_STATUS" == PUBLISH ]]; then
+                            SUMMARY_RECHECK="$(PYTHONPATH="$ROOT/scripts${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" -B - "$SUMMARY_REPAIRED_JSON" "$SUMMARY_REPAIRED_BRIEF" <<'PY'
+import json, sys
+from pathlib import Path
+from top3_summary_binding_repair import check_summary_binding
+print(check_summary_binding(json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")), Path(sys.argv[2]).read_text(encoding="utf-8")))
+PY
+                            )" || SUMMARY_RECHECK=FAIL
+                            if [[ "$SUMMARY_RECHECK" == PASS ]]; then
+                                SUMMARY_BINDING_RESULT=PASS
+                                SUMMARY_BINDING_REPAIR_RESULT=PASS
+                                VALIDATED_JSON="$SUMMARY_REPAIRED_JSON"
+                                CANDIDATE_OUTPUT="$SUMMARY_REPAIRED_CANDIDATES"
+                                cp "$SUMMARY_REPAIRED_BRIEF" "$GATE_OUTPUT" || fail "summary_binding_brief_copy_failed"
+                            else
+                                FAILURE_REASON=top3_summary_binding_repair_validation_failed
+                                GATE_RESULT=FAIL
+                            fi
+                        else
+                            JSON_CONTRACT_RESULT=FAIL
+                            JSON_CONTRACT_REASON="${SUMMARY_CONTRACT_REASON:-summary_binding_repair_contract_invalid}"
+                            FAILURE_REASON="top3_summary_binding_json_contract_failed:${SUMMARY_CONTRACT_REASON:-invalid}"
+                            GATE_RESULT=FAIL
+                        fi
+                    else
+                        FAILURE_REASON=top3_summary_binding_repair_failed
+                        GATE_RESULT=FAIL
+                    fi
+                fi
+                if [[ "$GATE_RESULT" == PASS ]] && EVIDENCE_INFO="$("$PYTHON_BIN" -B "$EVIDENCE_GATE" "$VALIDATED_JSON" \
                     "$GATE_OUTPUT" "$EVIDENCE_OUTPUT" 2>&1)"; then
                     read -r EVIDENCE_CONSISTENCY_RESULT EVIDENCE_CONSISTENCY_REASON <<< "$EVIDENCE_INFO"
-                else
+                elif [[ "$GATE_RESULT" == PASS ]]; then
                     read -r EVIDENCE_CONSISTENCY_RESULT EVIDENCE_CONSISTENCY_REASON <<< "$EVIDENCE_INFO"
                     FAILURE_REASON="${EVIDENCE_CONSISTENCY_REASON:-top3_evidence_inconsistent}"
                     GATE_RESULT="FAIL"
@@ -454,6 +515,10 @@ for STAGE in GENERAL TRUSTED_SOURCES CATEGORY_EXPANSION; do
         --selection-repair-attempted "$SELECTION_REPAIR_ATTEMPTED" \
         --selection-repair-result "$SELECTION_REPAIR_RESULT" \
         --selection-repair-reason "$SELECTION_REPAIR_REASON" \
+        --summary-binding-checked "$SUMMARY_BINDING_CHECKED" \
+        --summary-binding-result "$SUMMARY_BINDING_RESULT" \
+        --summary-binding-repair-attempted "$SUMMARY_BINDING_REPAIR_ATTEMPTED" \
+        --summary-binding-repair-result "$SUMMARY_BINDING_REPAIR_RESULT" \
         --run-id "$RUN_ID" || fail "diagnostic_attempt_save_failed"
 
     if [[ "$FAILURE_REASON" == "pass" ]]; then
