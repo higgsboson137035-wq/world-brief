@@ -75,7 +75,7 @@ class ResumeSavedRunTests(unittest.TestCase):
         payload = self.payload()
         payload["top3"][1]["source_url"] += "?wrong=1"
         self.save_payload(payload)
-        with self.assertRaisesRegex(ResumeFailure, "evidence_consistency_failed"):
+        with self.assertRaisesRegex(ResumeFailure, "candidate_identity_binding_failed"):
             prepare_resume(self.root, DATE, RUN, output_dir=self.output_dir)
         self.assertFalse(self.output_dir.exists())
 
@@ -106,6 +106,33 @@ class ResumeSavedRunTests(unittest.TestCase):
         self.assertTrue(Path(result["draft_markdown"]).is_file())
         self.assertFalse((self.root / "drafts" / f"{DATE}-human-review.md").exists())
         self.assertFalse((self.root / "drafts" / f"{DATE}-human-review.html").exists())
+
+    def test_2026_11_21_fixture_recovers_with_identity_repair_only(self):
+        source = Path(__file__).resolve().parents[1] / "logs/runs/2026-11-21"
+        target = self.root / "logs/runs/2026-11-21"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, target)
+        before = {
+            name: (target / name).read_bytes()
+            for name in ("diagnostic.json", "attempt-1-original-json-output.json",
+                         "attempt-1-candidates.json", "attempt-1-cumulative-candidates.json")
+        }
+        result = prepare_resume(
+            self.root, "2026-11-21", "run-01", output_dir=self.output_dir,
+            resumed_at="2026-11-21T08:00:00Z",
+        )
+        self.assertEqual(result["resume_candidate_identity_binding"], "PASS")
+        self.assertTrue(result["resume_candidate_identity_binding_repair_attempted"])
+        self.assertEqual(result["resume_candidate_identity_binding_repair_result"], "PASS")
+        self.assertEqual(result["resume_original_top3_candidate_ids"], ["C1", "C2", "C3"])
+        self.assertEqual(result["resume_repaired_top3_candidate_ids"], ["C3", "C2", "C7"])
+        self.assertEqual(result["resume_top3_summary_binding_repair"], "NOT_NEEDED")
+        self.assertEqual(result["resume_evidence_consistency"], "PASS")
+        self.assertEqual(result["resume_article_completeness"], "PASS")
+        self.assertEqual(result["resume_quality_gate"], "pass")
+        self.assertEqual(result["final_status"], "RESUME_DRAFT_READY")
+        for name, content in before.items():
+            self.assertEqual((target / name).read_bytes(), content, name)
 
     def test_resume_does_not_invoke_search_or_codex_and_only_publication_flag_is_false(self):
         with patch("scripts.resume_saved_run.validate_envelope", wraps=resume_saved_run.validate_envelope) as contract_gate:

@@ -218,6 +218,12 @@ def start_run(
         "summary_binding_result": "NOT_RUN",
         "summary_binding_repair_attempted": False,
         "summary_binding_repair_result": "NOT_ATTEMPTED",
+        "identity_binding_checked": False,
+        "identity_binding_result": "NOT_RUN",
+        "identity_binding_repair_attempted": False,
+        "identity_binding_repair_result": "NOT_ATTEMPTED",
+        "original_top3_candidate_ids": [],
+        "repaired_top3_candidate_ids": [],
         "search_stage": None,
         "search_strategy": None,
         "query_family": None,
@@ -260,6 +266,9 @@ def record_attempt(
     selection_repair_output: Path | None = None,
     selection_repair_metadata: dict | None = None,
     summary_binding_metadata: dict | None = None,
+    identity_binding_metadata: dict | None = None,
+    identity_repaired_json: Path | None = None,
+    validated_json: Path | None = None,
 ) -> None:
     value = load_record(run_date, run_id)
     directory = run_dir(run_date, run_id)
@@ -373,6 +382,54 @@ def record_attempt(
     }
     if summary_binding_metadata:
         summary_binding.update(summary_binding_metadata)
+    identity_binding = {
+        "identity_binding_checked": False,
+        "identity_binding_result": "NOT_RUN",
+        "identity_binding_repair_attempted": False,
+        "identity_binding_repair_result": "NOT_ATTEMPTED",
+        "original_top3_candidate_ids": [],
+        "repaired_top3_candidate_ids": [],
+    }
+    if identity_binding_metadata:
+        identity_binding.update(identity_binding_metadata)
+    original_top_ids: list[object] = []
+    if original_json_output is not None and original_json_output.exists():
+        try:
+            original_envelope = json.loads(original_json_output.read_text(encoding="utf-8"))
+            original_top_ids = [item.get("candidate_id") for item in original_envelope.get("top3", [])
+                                if isinstance(item, dict)]
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            pass
+    effective_path = validated_json if validated_json is not None and validated_json.exists() else original_json_output
+    diagnostic_top_ids = original_top_ids
+    diagnostic_selected_ids: list[object] = []
+    effective_payload_read = False
+    if effective_path is not None and effective_path.exists():
+        try:
+            effective = json.loads(effective_path.read_text(encoding="utf-8"))
+            effective_payload_read = (
+                isinstance(effective, dict)
+                and isinstance(effective.get("top3"), list)
+                and isinstance(effective.get("candidate_diagnostics"), dict)
+            )
+            diagnostic_top_ids = [item.get("candidate_id") for item in effective.get("top3", [])
+                                  if isinstance(item, dict)]
+            effective_candidates = effective.get("candidate_diagnostics", {}).get("candidates", [])
+            diagnostic_selected_ids = [item.get("candidate_id") for item in effective_candidates
+                                       if isinstance(item, dict) and item.get("selected_for_top3") is True]
+            if identity_repaired_json is not None and identity_repaired_json.exists():
+                identity_binding["repaired_top3_candidate_ids"] = diagnostic_top_ids
+        except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+            pass
+    if not effective_payload_read and evidence_consistency.get("top3_candidate_ids"):
+        diagnostic_top_ids = evidence_consistency["top3_candidate_ids"]
+        diagnostic_selected_ids = evidence_consistency.get("selected_candidate_ids", [])
+    identity_binding["original_top3_candidate_ids"] = original_top_ids
+    identity_binding["top3_candidate_ids"] = diagnostic_top_ids
+    identity_binding["selected_candidate_ids"] = diagnostic_selected_ids
+    # Preserve ID diagnostics even when the evidence consistency gate has not run.
+    evidence_consistency["top3_candidate_ids"] = diagnostic_top_ids
+    evidence_consistency["selected_candidate_ids"] = diagnostic_selected_ids
     gate = {
         "attempt": number,
         "search_stage": search_stage,
@@ -398,6 +455,7 @@ def record_attempt(
         "selection_repair_output": selection_output_target.name if selection_output_target.exists() else None,
         **selection_metadata,
         **summary_binding,
+        **identity_binding,
     }
     atomic_json(gate_target, gate)
     attempts = [item for item in value.get("attempts", []) if item.get("attempt") != number]
@@ -409,6 +467,7 @@ def record_attempt(
         "candidate_diagnostics": candidate_target.name,
         **repair,
         **summary_binding,
+        **identity_binding,
     })
     attempts.sort(key=lambda item: item["attempt"])
     value["attempts"] = attempts
@@ -434,6 +493,9 @@ def record_attempt(
         "evidence_consistency_reason", "evidence_consistency_details",
     ):
         value[key] = evidence_consistency.get(key)
+    value["top3_candidate_ids"] = diagnostic_top_ids
+    value["selected_candidate_ids"] = diagnostic_selected_ids
+    value.update(identity_binding)
     for key in (
         "stage_candidate_count", "stage_eligible_count", "cumulative_candidate_count",
         "cumulative_eligible_count", "cumulative_candidate_ids", "cumulative_eligible_ids",
@@ -637,6 +699,12 @@ def main() -> int:
     attempt.add_argument("--summary-binding-result", default="NOT_RUN")
     attempt.add_argument("--summary-binding-repair-attempted", choices=("true", "false"), default="false")
     attempt.add_argument("--summary-binding-repair-result", default="NOT_ATTEMPTED")
+    attempt.add_argument("--identity-binding-checked", choices=("true", "false"), default="false")
+    attempt.add_argument("--identity-binding-result", default="NOT_RUN")
+    attempt.add_argument("--identity-binding-repair-attempted", choices=("true", "false"), default="false")
+    attempt.add_argument("--identity-binding-repair-result", default="NOT_ATTEMPTED")
+    attempt.add_argument("--identity-repaired-json", type=Path)
+    attempt.add_argument("--validated-json", type=Path)
     extract = sub.add_parser("extract")
     extract.add_argument("raw_output", type=Path)
     extract.add_argument("brief_output", type=Path)
@@ -706,7 +774,12 @@ def main() -> int:
                                "summary_binding_result": args.summary_binding_result,
                                "summary_binding_repair_attempted": args.summary_binding_repair_attempted == "true",
                                "summary_binding_repair_result": args.summary_binding_repair_result,
-                           })
+                           }, {
+                               "identity_binding_checked": args.identity_binding_checked == "true",
+                               "identity_binding_result": args.identity_binding_result,
+                               "identity_binding_repair_attempted": args.identity_binding_repair_attempted == "true",
+                               "identity_binding_repair_result": args.identity_binding_repair_result,
+                           }, args.identity_repaired_json, args.validated_json)
         elif args.command == "extract":
             status, diag = extract_response(args.raw_output, args.brief_output, args.candidate_output)
             print(f"{status} {diag}")

@@ -26,13 +26,15 @@ try:
     from .review_draft_gate import validate_text
     from .top3_evidence_gate import validate_consistency
     from .article_completeness_repair import repair_envelope, validate_completeness
-    from .top3_summary_binding_repair import repair_summary_binding
+    from .candidate_identity_binding import evaluate_identity_binding, repair_identity_binding
+    from .top3_summary_binding_repair import check_summary_binding, repair_summary_binding
 except ImportError:  # Executed as a standalone script.
     from json_contract import ContractError, parse_json, validate_envelope
     from review_draft_gate import validate_text
     from top3_evidence_gate import validate_consistency
     from article_completeness_repair import repair_envelope, validate_completeness
-    from top3_summary_binding_repair import repair_summary_binding
+    from candidate_identity_binding import evaluate_identity_binding, repair_identity_binding
+    from top3_summary_binding_repair import check_summary_binding, repair_summary_binding
 
 
 RUN_ID_RE = re.compile(r"^run-\d{2}$")
@@ -236,7 +238,17 @@ def prepare_resume(root: Path, run_date: str, run_id: str, *, output_dir: Path |
         diagnostic.get("final_gate_reason") == "article_source_metadata_invalid"
         or attempt.get("gate_reason") == "article_source_metadata_invalid"
     )
-    if not failed_evidence and not failed_article_completeness:
+    failed_identity_binding = (
+        diagnostic.get("identity_binding_result") == "FAIL"
+        or attempt.get("identity_binding_result") == "FAIL"
+        or diagnostic.get("final_gate_reason") in {
+            "top3_summary_binding_repair_failed", "candidate_identity_binding_repair_failed",
+        }
+        or attempt.get("gate_reason") in {
+            "top3_summary_binding_repair_failed", "candidate_identity_binding_repair_failed",
+        }
+    )
+    if not failed_evidence and not failed_article_completeness and not failed_identity_binding:
         raise ResumeFailure("saved_run_failure_not_resume_eligible")
 
     payload_path = _recorded_payload_path(run_dir, diagnostic)
@@ -248,23 +260,42 @@ def prepare_resume(root: Path, run_date: str, run_id: str, *, output_dir: Path |
     if final_status != "PUBLISH":
         raise ResumeFailure("saved_payload_not_publish")
 
+    identity_report = evaluate_identity_binding(envelope)
+    identity_binding_repaired = False
+    original_identity_ids = identity_report["top3_candidate_ids"]
+    if identity_report["identity_binding_result"] != "PASS":
+        identity_result = repair_identity_binding(envelope)
+        if identity_result is None:
+            raise ResumeFailure(f"candidate_identity_binding_failed:{identity_report['identity_binding_reason']}")
+        envelope, identity_report = identity_result
+        identity_binding_repaired = True
+        try:
+            repaired_status, repaired_body, _ = validate_envelope(envelope)
+        except (ContractError, ValueError) as exc:
+            raise ResumeFailure(f"json_contract_failed:{exc}") from exc
+        if repaired_status != "PUBLISH" or repaired_body != body:
+            raise ResumeFailure("candidate_identity_binding_repair_validation_failed")
+        if evaluate_identity_binding(envelope)["identity_binding_result"] != "PASS":
+            raise ResumeFailure("candidate_identity_binding_repair_validation_failed")
+
     summary_binding_repaired = False
-    evidence = validate_consistency(envelope, body)
-    if evidence.get("evidence_consistency_result") != "PASS":
+    if check_summary_binding(envelope, body) != "PASS":
         repaired_summary = repair_summary_binding(envelope, body)
         if repaired_summary is None:
-            raise ResumeFailure(f"evidence_consistency_failed:{evidence.get('evidence_consistency_reason')}")
+            raise ResumeFailure("top3_summary_binding_repair_failed")
         envelope, body = repaired_summary
         summary_binding_repaired = True
         try:
             repaired_status, repaired_body, _ = validate_envelope(envelope)
         except (ContractError, ValueError) as exc:
             raise ResumeFailure(f"json_contract_failed:{exc}") from exc
-        if repaired_status != "PUBLISH" or repaired_body != body:
+        if (repaired_status != "PUBLISH" or repaired_body != body
+                or check_summary_binding(envelope, body) != "PASS"):
             raise ResumeFailure("top3_summary_binding_repair_validation_failed")
-        evidence = validate_consistency(envelope, body)
-        if evidence.get("evidence_consistency_result") != "PASS":
-            raise ResumeFailure(f"evidence_consistency_failed:{evidence.get('evidence_consistency_reason')}")
+
+    evidence = validate_consistency(envelope, body)
+    if evidence.get("evidence_consistency_result") != "PASS":
+        raise ResumeFailure(f"evidence_consistency_failed:{evidence.get('evidence_consistency_reason')}")
 
     completeness_repaired = False
     if validate_completeness(envelope, body) != "PASS":
@@ -309,6 +340,11 @@ def prepare_resume(root: Path, run_date: str, run_id: str, *, output_dir: Path |
         "source_json": payload_path.name,
         "source_json_sha256": hashlib.sha256(payload_path.read_bytes()).hexdigest(),
         "resume_json_contract": "PASS",
+        "resume_candidate_identity_binding": "PASS",
+        "resume_candidate_identity_binding_repair_attempted": identity_binding_repaired,
+        "resume_candidate_identity_binding_repair_result": "PASS" if identity_binding_repaired else "NOT_NEEDED",
+        "resume_original_top3_candidate_ids": original_identity_ids,
+        "resume_repaired_top3_candidate_ids": identity_report["top3_candidate_ids"] if identity_binding_repaired else [],
         "resume_top3_summary_binding_repair": "PASS" if summary_binding_repaired else "NOT_NEEDED",
         "resume_article_completeness_repair": "PASS" if completeness_repaired else "NOT_NEEDED",
         "resume_article_completeness": "PASS",

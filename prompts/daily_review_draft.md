@@ -83,6 +83,8 @@ Tomorrow's Watchlistは3〜5項目。全体を落ち着いた日本語で簡潔�
 
 ## Required machine-readable response contract
 
+`candidate_id`はcandidate diagnosticsに記載された元IDをそのまま使い、Top 3の順位番号とは別物として扱います。候補IDをTop 3の順番に合わせてC1/C2/C3へ再採番してはいけません。各Top 3項目ではheadline、source_title、source、source_url、summaryと同じcandidateのIDを保持してください。たとえばTop 3の順がC7、C2、C11なら、structured Top 3のIDも順にC7、C2、C11です。
+
 出力はJSON object 1つだけにし、Markdown fenceや前後の説明を付けません。schemaは次のとおりです。NO_PUBLISHは現在stageの結果だけを示し、scriptが次のstageへ進むかを管理します。
 
 ```json
@@ -91,7 +93,7 @@ Tomorrow's Watchlistは3〜5項目。全体を落ち着いた日本語で簡潔�
   "brief_markdown": "_Date: YYYY-MM-DD_\n...完成Brief本文...",
   "top3": [
     {
-      "candidate_id": "C1",
+      "candidate_id": "C7",
       "headline": "candidate title exact copy",
       "source_title": "candidate title exact copy",
       "source": "candidate source exact copy",
@@ -107,7 +109,7 @@ Tomorrow's Watchlistは3〜5項目。全体を落ち着いた日本語で簡潔�
       "summary": "brief_markdownのToday's Top 3にそのまま記載した要約"
     },
     {
-      "candidate_id": "C3",
+      "candidate_id": "C11",
       "headline": "candidate title exact copy",
       "source_title": "candidate title exact copy",
       "source": "candidate source exact copy",

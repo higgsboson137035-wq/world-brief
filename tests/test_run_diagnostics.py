@@ -257,6 +257,41 @@ class RunDiagnosticsTests(unittest.TestCase):
         self.assertEqual(record["evidence_consistency_result"], "PASS")
         self.assertEqual(record["evidence_consistency_reason"], "pass")
 
+    def test_identity_binding_ids_are_saved_before_evidence_consistency(self):
+        diagnostics.start_run(self.run_date)
+        root = Path(self.temp.name)
+        candidates = [
+            {"candidate_id": cid, "selected_for_top3": cid in {"C2", "C3", "C7"}}
+            for cid in ("C1", "C2", "C3", "C7")
+        ]
+        original = root / "original.json"
+        repaired = root / "identity-repaired.json"
+        original.write_text(json.dumps({"top3": [{"candidate_id": cid} for cid in ("C1", "C2", "C3")],
+                                        "candidate_diagnostics": {"candidates": candidates}}), encoding="utf-8")
+        repaired.write_text(json.dumps({"top3": [{"candidate_id": cid} for cid in ("C3", "C2", "C7")],
+                                        "candidate_diagnostics": {"candidates": candidates}}), encoding="utf-8")
+        raw, candidate, gate = [root / name for name in ("raw", "candidate.json", "gate.md")]
+        raw.write_text("raw", encoding="utf-8")
+        candidate.write_text(json.dumps({"status": "RECORDED", "coverage": "COMPLETE",
+                                         "candidates": candidates}), encoding="utf-8")
+        gate.write_text("brief", encoding="utf-8")
+        diagnostics.record_attempt(
+            self.run_date, 1, 0, "PASS", "pass", False, "RECORDED", raw, candidate, gate,
+            "GENERAL", "GENERAL", "general_world_news", original_json_output=original,
+            identity_binding_metadata={"identity_binding_checked": True, "identity_binding_result": "PASS",
+                                      "identity_binding_repair_attempted": True,
+                                      "identity_binding_repair_result": "PASS"},
+            identity_repaired_json=repaired, validated_json=repaired,
+        )
+        record = json.loads(diagnostics.record_path(self.run_date).read_text(encoding="utf-8"))
+        attempt = json.loads((diagnostics.run_dir(self.run_date) / "attempt-1-gate.json").read_text(encoding="utf-8"))
+        for saved in (record, attempt):
+            self.assertEqual(saved["top3_candidate_ids"], ["C3", "C2", "C7"])
+            self.assertEqual(saved["selected_candidate_ids"], ["C2", "C3", "C7"])
+            self.assertEqual(saved["original_top3_candidate_ids"], ["C1", "C2", "C3"])
+            self.assertEqual(saved["repaired_top3_candidate_ids"], ["C3", "C2", "C7"])
+            self.assertEqual(saved["identity_binding_result"], "PASS")
+
     def test_rendered_trusted_source_prompt_has_individual_queries_and_no_template_markers(self):
         template = Path(__file__).resolve().parents[1] / "prompts/daily_review_draft.md"
         rendered = Path(self.temp.name) / "trusted.md"

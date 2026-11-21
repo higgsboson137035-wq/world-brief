@@ -19,6 +19,7 @@ EVIDENCE_GATE = ROOT / "scripts" / "top3_evidence_gate.py"
 CANDIDATE_POOL = ROOT / "scripts" / "candidate_pool.py"
 ARTICLE_COMPLETENESS = ROOT / "scripts" / "article_completeness_repair.py"
 SUMMARY_BINDING_REPAIR = ROOT / "scripts" / "top3_summary_binding_repair.py"
+IDENTITY_BINDING = ROOT / "scripts" / "candidate_identity_binding.py"
 
 
 def make_brief(duplicate=False, missing_top3=False, japan_heading_only=False, japan_short=False, japan_shallow=False, extra_heading=False):
@@ -156,6 +157,7 @@ class GenerateReviewDraftTests(unittest.TestCase):
         shutil.copy2(CANDIDATE_POOL, self.root / "scripts" / CANDIDATE_POOL.name)
         shutil.copy2(ARTICLE_COMPLETENESS, self.root / "scripts" / ARTICLE_COMPLETENESS.name)
         shutil.copy2(SUMMARY_BINDING_REPAIR, self.root / "scripts" / SUMMARY_BINDING_REPAIR.name)
+        shutil.copy2(IDENTITY_BINDING, self.root / "scripts" / IDENTITY_BINDING.name)
         shutil.copy2(PROMPT, self.root / "prompts" / PROMPT.name)
         self.fake_bin = self.root / "fake-bin"
         self.fake_bin.mkdir()
@@ -633,10 +635,11 @@ class GenerateReviewDraftTests(unittest.TestCase):
         before = self._snapshot_public()
         result = self._run("custom")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("top3_summary_binding_repair_failed", result.stderr)
+        self.assertIn("candidate_identity_binding_repair_failed", result.stderr)
         record = json.loads((self.root / "logs/runs/2026-10-04/diagnostic.json").read_text(encoding="utf-8"))
         self.assertEqual(record["evidence_consistency_result"], "NOT_RUN")
-        self.assertEqual(record["summary_binding_result"], "FAIL")
+        self.assertEqual(record["identity_binding_result"], "FAIL")
+        self.assertEqual(record["summary_binding_result"], "NOT_RUN")
         self.assertEqual(record["original_gate_result"], "NOT_RUN")
         self.assertFalse(record["format_repair_attempted"])
         self.assertFalse((self.root / "drafts/2026-10-04-human-review.md").exists())

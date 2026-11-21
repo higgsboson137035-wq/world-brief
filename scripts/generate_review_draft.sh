@@ -69,6 +69,7 @@ DIAGNOSTICS="$ROOT/scripts/run_diagnostics.py"
 FORMAT_REPAIR="$ROOT/scripts/format_repair.py"
 JSON_CONTRACT="$ROOT/scripts/json_contract.py"
 EVIDENCE_GATE="$ROOT/scripts/top3_evidence_gate.py"
+IDENTITY_BINDING="$ROOT/scripts/candidate_identity_binding.py"
 ARTICLE_COMPLETENESS="$ROOT/scripts/article_completeness_repair.py"
 CANDIDATE_POOL="$ROOT/scripts/candidate_pool.py"
 CUMULATIVE_POOL="$WORK_DIR/cumulative-candidates.json"
@@ -181,6 +182,12 @@ for STAGE in GENERAL TRUSTED_SOURCES CATEGORY_EXPANSION; do
     SUMMARY_BINDING_RESULT=NOT_RUN
     SUMMARY_BINDING_REPAIR_ATTEMPTED=false
     SUMMARY_BINDING_REPAIR_RESULT=NOT_ATTEMPTED
+    IDENTITY_BINDING_CHECKED=false
+    IDENTITY_BINDING_RESULT=NOT_RUN
+    IDENTITY_BINDING_REPAIR_ATTEMPTED=false
+    IDENTITY_BINDING_REPAIR_RESULT=NOT_ATTEMPTED
+    IDENTITY_REPAIRED_JSON="$WORK_DIR/identity-binding-repaired-${ATTEMPT}.json"
+    IDENTITY_REPAIRED_CANDIDATES="$WORK_DIR/identity-binding-candidates-${ATTEMPT}.json"
     QUALITY_GATE_RAN=false
     VALIDATED_JSON="$RAW_OUTPUT"
     if run_codex "$RENDERED_PROMPT"; then
@@ -320,6 +327,34 @@ for STAGE in GENERAL TRUSTED_SOURCES CATEGORY_EXPANSION; do
                 GATE_RESULT="RETRY"
             elif [[ "$JSON_CONTRACT_RESULT" == "PASS" && "$RESPONSE_STATUS" == "PUBLISH" ]]; then
                 GATE_RESULT="PASS"
+                IDENTITY_BINDING_CHECKED=true
+                IDENTITY_INFO="$("$PYTHON_BIN" -B "$IDENTITY_BINDING" check "$VALIDATED_JSON" 2>&1)" || true
+                IDENTITY_BINDING_RESULT="$("$PYTHON_BIN" -B -c 'import json,sys; print(json.loads(sys.argv[1]).get("identity_binding_result", "FAIL"))' "$IDENTITY_INFO" 2>/dev/null || printf FAIL)"
+                if [[ "$IDENTITY_BINDING_RESULT" != PASS ]]; then
+                    IDENTITY_BINDING_REPAIR_ATTEMPTED=true
+                    IDENTITY_BINDING_REPAIR_RESULT=FAIL
+                    if "$PYTHON_BIN" -B "$IDENTITY_BINDING" repair "$VALIDATED_JSON" "$IDENTITY_REPAIRED_JSON" >/dev/null 2>&1; then
+                        IDENTITY_CONTRACT_INFO="$("$PYTHON_BIN" -B "$JSON_CONTRACT" validate "$IDENTITY_REPAIRED_JSON" \
+                            "$GATE_OUTPUT" "$IDENTITY_REPAIRED_CANDIDATES" 2>&1)"
+                        read -r IDENTITY_CONTRACT_STATUS IDENTITY_CONTRACT_REASON <<< "$IDENTITY_CONTRACT_INFO"
+                        if [[ "$IDENTITY_CONTRACT_STATUS" == PUBLISH ]] && \
+                           [[ "$("$PYTHON_BIN" -B "$IDENTITY_BINDING" check "$IDENTITY_REPAIRED_JSON" 2>/dev/null | \
+                                "$PYTHON_BIN" -B -c 'import json,sys; print(json.load(sys.stdin).get("identity_binding_result", "FAIL"))')" == PASS ]]; then
+                            IDENTITY_BINDING_RESULT=PASS
+                            IDENTITY_BINDING_REPAIR_RESULT=PASS
+                            VALIDATED_JSON="$IDENTITY_REPAIRED_JSON"
+                            CANDIDATE_OUTPUT="$IDENTITY_REPAIRED_CANDIDATES"
+                        else
+                            IDENTITY_BINDING_RESULT=FAIL
+                            FAILURE_REASON="candidate_identity_binding_repair_validation_failed"
+                            GATE_RESULT=FAIL
+                        fi
+                    else
+                        FAILURE_REASON="candidate_identity_binding_repair_failed"
+                        GATE_RESULT=FAIL
+                    fi
+                fi
+                if [[ "$GATE_RESULT" == PASS ]]; then
                 SUMMARY_BINDING_CHECKED=true
                 SUMMARY_BINDING_RESULT="$(PYTHONPATH="$ROOT/scripts${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" -B - "$VALIDATED_JSON" "$GATE_OUTPUT" <<'PY'
 import json, sys
@@ -438,6 +473,7 @@ PY
                         GATE_RESULT="FAIL"
                     fi
                 fi
+                fi
             fi
         fi
     fi
@@ -519,6 +555,12 @@ PY
         --summary-binding-result "$SUMMARY_BINDING_RESULT" \
         --summary-binding-repair-attempted "$SUMMARY_BINDING_REPAIR_ATTEMPTED" \
         --summary-binding-repair-result "$SUMMARY_BINDING_REPAIR_RESULT" \
+        --identity-binding-checked "$IDENTITY_BINDING_CHECKED" \
+        --identity-binding-result "$IDENTITY_BINDING_RESULT" \
+        --identity-binding-repair-attempted "$IDENTITY_BINDING_REPAIR_ATTEMPTED" \
+        --identity-binding-repair-result "$IDENTITY_BINDING_REPAIR_RESULT" \
+        --identity-repaired-json "$IDENTITY_REPAIRED_JSON" \
+        --validated-json "$VALIDATED_JSON" \
         --run-id "$RUN_ID" || fail "diagnostic_attempt_save_failed"
 
     if [[ "$FAILURE_REASON" == "pass" ]]; then
